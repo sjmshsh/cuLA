@@ -57,30 +57,18 @@ kda_fwd_prefill(
         num_qk_heads);
     TORCH_CHECK(head_size == v.size(2), "KDA requires Q and V head dim to match, got ", head_size, " vs ", v.size(2));
 
-    // Allocate output if not provided. Output is sized by V/O heads.
+    // Allocate output if not provided
     torch::Tensor output = output_.has_value() ? output_.value()
                                                : torch::empty(
                                                      {packed_seq, num_v_heads, head_size},
                                                      torch::TensorOptions().dtype(q.dtype()).device(q.device()));
 
-    // Allocate output state only when the caller actually needs it. When
-    // output_final_state=False and the caller did not pass an out tensor, we return a
-    // 0-element placeholder tensor (no GMEM allocation) and pass nullptr to the
-    // kernel; the kernel will then skip the final-state write-back entirely, saving
-    // a [N, HV, D, D] fp32 allocation + GMEM store.
-    torch::Tensor output_state;
-    bool need_output_state_buffer = output_final_state || output_state_.has_value();
-    if (output_state_.has_value()) {
-        output_state = output_state_.value();
-    } else if (need_output_state_buffer) {
-        output_state = torch::zeros(
-            {num_seqs, num_v_heads, head_size, head_size},
-            torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
-    } else {
-        // 0-element placeholder so the returned tuple never carries an undefined Tensor.
-        output_state = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
-    }
-
+    // Allocate output state if not provided
+   torch::Tensor output_state = output_state_.has_value()
+                                     ? output_state_.value()
+                                     : torch::zeros(
+                                           {num_seqs, num_v_heads, head_size, head_size},
+                                           torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
     // Validate dtypes
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
     TORCH_CHECK(k.dtype() == torch::kBFloat16, "k must be bfloat16");
