@@ -34,7 +34,8 @@ kda_fwd_prefill(
     torch::Tensor const& cu_seqlens,
     torch::Tensor workspace_buffer,
     float scale,
-    bool safe_gate) {
+    bool safe_gate,
+    bool output_final_state) {
     // Q, K: [packed_seq, num_qk_heads, D]
     // V/O/g: [packed_seq, num_v_heads, D]   (GVA: num_v_heads is a positive integer multiple of num_qk_heads)
     auto packed_seq = q.size(0);
@@ -63,12 +64,23 @@ kda_fwd_prefill(
                                                      {packed_seq, num_v_heads, head_size},
                                                      torch::TensorOptions().dtype(q.dtype()).device(q.device()));
 
-    // Allocate output state if not provided. State is per V-head.
-    torch::Tensor output_state = output_state_.has_value()
-                                     ? output_state_.value()
-                                     : torch::zeros(
-                                           {num_seqs, num_v_heads, head_size, head_size},
-                                           torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+    // Allocate output state only when the caller actually needs it. When
+    // output_final_state=False and the caller did not pass an out tensor, we return a
+    // 0-element placeholder tensor (no GMEM allocation) and pass nullptr to the
+    // kernel; the kernel will then skip the final-state write-back entirely, saving
+    // a [N, HV, D, D] fp32 allocation + GMEM store.
+    torch::Tensor output_state;
+    bool need_output_state_buffer = output_final_state || output_state_.has_value();
+    if (output_state_.has_value()) {
+        output_state = output_state_.value();
+    } else if (need_output_state_buffer) {
+        output_state = torch::zeros(
+            {num_seqs, num_v_heads, head_size, head_size},
+            torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+    } else {
+        // 0-element placeholder so the returned tuple never carries an undefined Tensor.
+        output_state = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+    }
 
     // Validate dtypes
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
@@ -81,13 +93,17 @@ kda_fwd_prefill(
     TORCH_CHECK(k.is_contiguous(), "k must be contiguous");
     TORCH_CHECK(v.is_contiguous(), "v must be contiguous");
     TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
-    TORCH_CHECK(output_state.is_contiguous(), "output_state must be contiguous");
+    if (need_output_state_buffer) {
+        TORCH_CHECK(output_state.is_contiguous(), "output_state must be contiguous");
+    }
     TORCH_CHECK(cu_seqlens.is_contiguous(), "cu_seqlens must be contiguous");
     TORCH_CHECK(workspace_buffer.is_contiguous(), "workspace_buffer must be contiguous");
 
-    // Extract optional pointers
+    // Extract optional pointers. When the caller does not need the final state,
+    // output_state_ptr stays nullptr and the kernel skips its state write-back.
     float const* alpha_ptr = nullptr;
     float const* input_state_ptr = nullptr;
+    float* output_state_ptr = need_output_state_buffer ? output_state.data_ptr<float>() : nullptr;
 
     if (alpha_.has_value()) {
         auto& alpha = alpha_.value();
@@ -138,7 +154,7 @@ kda_fwd_prefill(
         kda::sm90::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float, bf16>(
             stream,
             reinterpret_cast<bf16*>(output.data_ptr()),
-            output_state.data_ptr<float>(),
+            output_state_ptr,
             reinterpret_cast<bf16 const*>(q.data_ptr()),
             reinterpret_cast<bf16 const*>(k.data_ptr()),
             reinterpret_cast<bf16 const*>(v.data_ptr()),
@@ -160,7 +176,7 @@ kda_fwd_prefill(
         kda::sm90::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float, float>(
             stream,
             reinterpret_cast<bf16*>(output.data_ptr()),
-            output_state.data_ptr<float>(),
+            output_state_ptr,
             reinterpret_cast<bf16 const*>(q.data_ptr()),
             reinterpret_cast<bf16 const*>(k.data_ptr()),
             reinterpret_cast<bf16 const*>(v.data_ptr()),

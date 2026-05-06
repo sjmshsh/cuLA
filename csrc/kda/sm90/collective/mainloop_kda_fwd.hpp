@@ -917,6 +917,19 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         };
 
         auto kv_store = [&]() INLINE_LAMBDA {  // tKVrKV is carried over whole mainloop
+            // Skip the final-state write-back entirely when the caller does not need it
+            // (i.e. output_final_state=False on the public API). The check is uniform
+            // across the launch, so the branch cost is negligible while it saves a full
+            // [N, num_v_heads, D, D] float32 store to GMEM.
+            if (params.ptr_output_state == nullptr) {
+                DPRINTF0_WG(
+                    "[%d,%d,%d,%d]>> skip tKVrKV -> tKVgKV (output_final_state=false)\n",
+                    seq_idx,
+                    q_head_idx,
+                    k_head_idx,
+                    v_head_idx);
+                return;
+            }
             DPRINTF0_WG("[%d,%d,%d,%d]>> save tKVrKV -> tKVgKV\n", seq_idx, q_head_idx, k_head_idx, v_head_idx);
             // GVA: state is stored per V/O head.
             int num_state_heads = problem_size.num_v_heads;

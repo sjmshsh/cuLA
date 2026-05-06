@@ -113,10 +113,14 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         workspace_buffer = _get_cache_buf("hopper_kda_fwd_workspace", workspace_size, q.device)
 
         # call the C++ kernel
-        # Signature: kda_fwd_prefill(output_, output_state_, q, k, v, input_state_, alpha_, beta_, cu_seqlens, workspace, scale, safe_gate)
+        # Signature: kda_fwd_prefill(output_, output_state_, q, k, v, input_state_,
+        #                            alpha_, beta_, cu_seqlens, workspace, scale,
+        #                            safe_gate, output_final_state)
+        # Passing output_final_state lets the C++ side skip allocating + writing back
+        # the [N, HV, D, D] fp32 state tensor when the caller does not need it.
         o, final_state = cula_cuda.kda_fwd_prefill(
             None,  # output_ (auto-allocate)
-            None,  # output_state_ (auto-allocate)
+            None,  # output_state_ (auto-allocate iff output_final_state=True)
             q,
             k,
             v,
@@ -127,15 +131,18 @@ class HopperChunkKDAFunction(torch.autograd.Function):
             workspace_buffer,
             scale,
             safe_gate,
+            output_final_state,
         )
 
         # reshape back
         o = rearrange(o, "(b t) h d -> b t h d", b=batch_size)
 
-        # Bug fix: respect output_final_state=False explicitly.
-        # The C++ kernel always allocates an output_state tensor, but the public API
-        # promises None when the caller did not opt-in.
-        return o.to(q.dtype), (final_state if output_final_state else None)
+        # When output_final_state=False, the C++ side returns an empty tensor; surface
+        # that as None in the public API. We still defend against future signature
+        # changes by checking output_final_state explicitly.
+        if not output_final_state:
+            final_state = None
+        return o.to(q.dtype), final_state
 
     @staticmethod
     @input_guard
