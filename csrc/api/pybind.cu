@@ -64,8 +64,7 @@ kda_fwd_prefill(
     torch::Tensor const& cu_seqlens,
     torch::Tensor workspace_buffer,
     float scale,
-    bool safe_gate,
-    bool output_final_state);
+    bool safe_gate);
 #endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

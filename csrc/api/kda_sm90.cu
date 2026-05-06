@@ -34,8 +34,7 @@ kda_fwd_prefill(
     torch::Tensor const& cu_seqlens,
     torch::Tensor workspace_buffer,
     float scale,
-    bool safe_gate,
-    bool output_final_state) {
+    bool safe_gate) {
     // Q, K: [packed_seq, num_qk_heads, D]
     // V/O/g: [packed_seq, num_v_heads, D]   (GVA: num_v_heads is a positive integer multiple of num_qk_heads)
     auto packed_seq = q.size(0);
@@ -154,7 +153,7 @@ kda_fwd_prefill(
         kda::sm90::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float, bf16>(
             stream,
             reinterpret_cast<bf16*>(output.data_ptr()),
-            output_state_ptr,
+            output_state.data_ptr<float>(),
             reinterpret_cast<bf16 const*>(q.data_ptr()),
             reinterpret_cast<bf16 const*>(k.data_ptr()),
             reinterpret_cast<bf16 const*>(v.data_ptr()),
@@ -176,7 +175,7 @@ kda_fwd_prefill(
         kda::sm90::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float, float>(
             stream,
             reinterpret_cast<bf16*>(output.data_ptr()),
-            output_state_ptr,
+            output_state.data_ptr<float>(),
             reinterpret_cast<bf16 const*>(q.data_ptr()),
             reinterpret_cast<bf16 const*>(k.data_ptr()),
             reinterpret_cast<bf16 const*>(v.data_ptr()),
