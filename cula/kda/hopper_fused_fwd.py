@@ -55,8 +55,6 @@ class HopperChunkKDAFunction(torch.autograd.Function):
             "q, k, v, g must share batch and sequence dimensions."
         )
 
-        # num_qk_heads: Q和K共享的注意力头数量，记作H
-        # num_v_heads: V，G（门控）共享的注意力头数量, 几座HV
         batch_size, seq_len, num_qk_heads, head_dim = q.shape
         num_v_heads = v.shape[-2]
         # Order matters: enforce positivity *before* the modulo so we never % 0.
@@ -115,11 +113,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         workspace_buffer = _get_cache_buf("hopper_kda_fwd_workspace", workspace_size, q.device)
 
         # call the C++ kernel
-        # Signature: kda_fwd_prefill(output_, output_state_, q, k, v, input_state_,
-        #                            alpha_, beta_, cu_seqlens, workspace, scale,
-        #                            safe_gate, output_final_state)
-        # Passing output_final_state lets the C++ side skip allocating + writing back
-        # the [N, HV, D, D] fp32 state tensor when the caller does not need it.
+        # Signature: kda_fwd_prefill(output_, output_state_, q, k, v, input_state_, alpha_, beta_, cu_seqlens, workspace, scale, safe_gate)
         o, final_state = cula_cuda.kda_fwd_prefill(
             None,  # output_ (auto-allocate)
             None,  # output_state_ (auto-allocate iff output_final_state=True)
