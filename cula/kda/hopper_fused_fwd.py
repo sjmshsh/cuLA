@@ -57,7 +57,6 @@ class HopperChunkKDAFunction(torch.autograd.Function):
 
         batch_size, seq_len, num_qk_heads, head_dim = q.shape
         num_v_heads = v.shape[-2]
-        # Order matters: enforce positivity *before* the modulo so we never % 0.
         assert num_qk_heads > 0, f"num_qk_heads must be positive, got {num_qk_heads}."
         assert num_v_heads > 0, f"num_v_heads must be positive, got {num_v_heads}."
         assert num_v_heads % num_qk_heads == 0, (
@@ -99,7 +98,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
             q, q_rstd = l2norm_fwd(q)
             k, k_rstd = l2norm_fwd(k)
 
-        # reshape to packed [T, H, D] / [T, HV, D] for the C++ kernel
+        # reshape q/k to packed [T, H, K] and v/g to [T, HV, K], beta to [T, HV] for the C++ kernel
         packed_seq = batch_size * seq_len
         q = q.reshape(packed_seq, num_qk_heads, head_dim).contiguous()
         k = k.reshape(packed_seq, num_qk_heads, head_dim).contiguous()
@@ -116,7 +115,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         # Signature: kda_fwd_prefill(output_, output_state_, q, k, v, input_state_, alpha_, beta_, cu_seqlens, workspace, scale, safe_gate)
         o, final_state = cula_cuda.kda_fwd_prefill(
             None,  # output_ (auto-allocate)
-            None,  # output_state_ (auto-allocate iff output_final_state=True)
+            None,  # output_state_ (auto-allocate)
             q,
             k,
             v,
@@ -127,7 +126,6 @@ class HopperChunkKDAFunction(torch.autograd.Function):
             workspace_buffer,
             scale,
             safe_gate,
-            output_final_state,
         )
 
         # reshape back
@@ -165,23 +163,23 @@ def cula_kda_prefill(
 
     Args:
         q (torch.Tensor):
-            queries of shape `[B, T, H, D]`.
+            queries of shape `[B, T, H, K]`.
         k (torch.Tensor):
-            keys of shape `[B, T, H, D]`.
+            keys of shape `[B, T, H, K]`.
         v (torch.Tensor):
-            values of shape `[B, T, HV, D]`.
+            values of shape `[B, T, HV, K]`.
         g (torch.Tensor):
-            (forget) gating tensor (in log space!) of shape `[B, T, HV, D]`.
+            (forget) gating tensor (in log space!) of shape `[B, T, HV, K]`.
         beta (torch.Tensor):
             betas of shape `[B, T, HV]`.
         scale (Optional[float]):
             Scale factor for the KDA attention scores.
             If not provided, it will default to `1 / sqrt(D)`. Default: `None`.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[N, HV, D, D]` for `N` input sequences.
+            Initial state of shape `[N, HV, K, K]` for `N` input sequences.
             Default: `None`.
         output_final_state (Optional[bool]):
-            Whether to output the final state of shape `[N, HV, D, D]`. Default: `False`.
+            Whether to output the final state of shape `[N, HV, K, K]`. Default: `False`.
         use_qk_l2norm_in_kernel (bool):
             Whether to apply L2norm to the q,k tensor internally. Default: `False`.
         use_gate_in_kernel (bool):
@@ -199,9 +197,9 @@ def cula_kda_prefill(
 
     Returns:
         o (torch.Tensor):
-            Outputs of shape `[B, T, HV, D]`.
+            Outputs of shape `[B, T, HV, K]`.
         final_state (torch.Tensor):
-            Final state of shape `[N, HV, D, D]` if `output_final_state=True` else `None`.
+            Final state of shape `[N, HV, K, K]` if `output_final_state=True` else `None`.
     """
     assert_hopper()
     assert safe_gate, "Only support safe_gate=True."
