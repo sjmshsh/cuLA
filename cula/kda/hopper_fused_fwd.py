@@ -55,6 +55,8 @@ class HopperChunkKDAFunction(torch.autograd.Function):
             "q, k, v, g must share batch and sequence dimensions."
         )
 
+        # num_qk_heads: Q和K共享的注意力头数量，记作H
+        # num_v_heads: V，G（门控）共享的注意力头数量, 几座HV
         batch_size, seq_len, num_qk_heads, head_dim = q.shape
         num_v_heads = v.shape[-2]
         # Order matters: enforce positivity *before* the modulo so we never % 0.
@@ -206,12 +208,6 @@ def cula_kda_prefill(
             Outputs of shape `[B, T, HV, D]`.
         final_state (torch.Tensor):
             Final state of shape `[N, HV, D, D]` if `output_final_state=True` else `None`.
-
-    GVA constraint:
-        - q.shape == k.shape == [B, T, H, D]
-        - v.shape == g.shape == [B, T, HV, D], beta.shape == [B, T, HV]
-        - HV must be a positive multiple of H. heads_per_group = HV // H.
-        - When HV == H this degenerates to the regular MHA case.
     """
     assert_hopper()
     assert safe_gate, "Only support safe_gate=True."
