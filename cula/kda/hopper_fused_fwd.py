@@ -137,12 +137,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         # reshape back
         o = rearrange(o, "(b t) h d -> b t h d", b=batch_size)
 
-        # When output_final_state=False, the C++ side returns an empty tensor; surface
-        # that as None in the public API. We still defend against future signature
-        # changes by checking output_final_state explicitly.
-        if not output_final_state:
-            final_state = None
-        return o.to(q.dtype), final_state
+        return o.to(q.dtype), final_state if output_final_state else None
 
     @staticmethod
     @input_guard
