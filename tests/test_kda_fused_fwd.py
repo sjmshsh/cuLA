@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Copyright 2025-2026 Ant Group Co., Ltd.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,410 +12,348 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-bench_kda_fused_fwd.py — Benchmark: cuLA fully-fused KDA forward vs FLA Triton baseline
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-Automatically selects the cuLA fully-fused implementation based on the current
-GPU architecture:
-  - sm100 (Blackwell) → cula.kda.blackwell_fused_fwd.flash_kda_prefill
-  - sm90  (Hopper)    → cula.kda.hopper_fused_fwd.cula_kda_prefill
+# Adapted from flash-linear-attention: https://github.com/fla-org/flash-linear-attention/blob/main/tests/ops/test_kda.py
 
-Compares:
-  - Accuracy: RMSE, relative max diff between cuLA fully-fused and FLA Triton
-  - Performance: kernel execution time (ms) with CUDA events
 
-Modes:
-  - Fixed-length: various (B, T) configs
-  - Varlen: sequences with 2-3x length variation
-
-Usage:
-  python bench_kda_fused_fwd.py [--mode fixed|varlen|both] [--ncu]
-
-With --ncu, warmup=1 and iters=1 for ncu profiling:
-  ncu --set full -o report python bench_kda_fused_fwd.py --mode varlen --ncu
-"""
-
-import argparse
-import os
-import pathlib
-import sys
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
-
+import pytest
 import torch
-from fla.ops.kda import chunk_kda as fla_chunk_kda
+import torch.nn.functional as F
+from fla.ops import chunk_kda as fla_chunk_kda
+from fla.ops.kda.gate import naive_kda_gate
+from fla.ops.kda.naive import naive_recurrent_kda
+from fla.utils import assert_close, device
 
-from benchmarks.utils import (
-    SEED,
-    build_varlen_configs,
-    exclusive_cumsum,
-    prepare_safe_gate_inputs,
-    set_seed,
+from cula.utils import get_kda_fused_fwd
+
+pytestmark = pytest.mark.sm90_only
+
+
+@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
+@pytest.mark.parametrize(
+    (
+        "B",
+        "T",
+        "H",
+        "HV",
+        "D",
+        "gate_logit_normalizer",
+        "mask_p",
+        "use_qk_l2norm_in_kernel",
+        "use_gate_in_kernel",
+        "safe_gate",
+        "use_initial_state",
+        "dtype",
+    ),
+    [
+        pytest.param(
+            *test,
+            id=("B{}-T{}-H{}-HV{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-init{}-{}").format(
+                *test
+            ),
+        )
+        for test in [
+            (1, 63, 1, 1, 128, 1, 0, False, False, True, True, torch.bfloat16),
+            (2, 500, 3, 3, 128, 1, 0, False, False, True, True, torch.bfloat16),
+            (2, 1000, 3, 3, 128, 1, 0.5, False, False, True, True, torch.bfloat16),
+            (3, 1024, 4, 4, 128, 0.1, 0, False, False, True, True, torch.bfloat16),
+            (4, 1024, 4, 4, 128, 1, 0, False, False, True, True, torch.bfloat16),
+            (4, 1024, 4, 4, 128, 1, 0, True, False, True, True, torch.bfloat16),
+            (2, 1500, 4, 4, 128, 10, 0, False, True, True, True, torch.bfloat16),
+            (4, 2048, 8, 8, 128, 1, 0, False, True, True, True, torch.bfloat16),
+            (2, 512, 2, 4, 128, 1, 0, False, False, True, True, torch.bfloat16),
+            (2, 1024, 2, 8, 128, 1, 0, False, True, True, True, torch.bfloat16),
+            (1, 64, 1, 2, 128, 1, 0, False, False, True, True, torch.bfloat16),
+            (1, 65, 1, 4, 128, 1, 0, False, False, True, False, torch.bfloat16),
+        ]
+    ],
 )
-from cula.utils import get_device_sm_version, get_kda_fused_fwd
+def test_safe_gate_chunk(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    D: int,
+    gate_logit_normalizer: float,
+    mask_p: float,
+    use_qk_l2norm_in_kernel: bool,
+    use_gate_in_kernel: bool,
+    safe_gate: bool,
+    use_initial_state: bool,
+    dtype: torch.dtype,
+    beta_dtype: torch.dtype,
+):
+    from fla.ops.kda.gate import naive_kda_lowerbound_gate
 
-# ============================================================
-# Resolve cuLA fully-fused implementation at import time
-# ============================================================
-_device = torch.device("cuda")
-_major, _minor = get_device_sm_version(_device)
-_SM_TAG = f"sm{_major}{_minor}"
-cula_kda_fused_fwd = get_kda_fused_fwd(_device)
+    cula_kda_fused_fwd = get_kda_fused_fwd(device)
 
-# ============================================================
-# Constants
-# ============================================================
-H, D = 64, 128
-WARMUP = 25
-N_ITERS = 100
-NCU_MODE = False
-SANITIZER_MODE = False
-HAS_INIT_STATE = False
+    torch.manual_seed(42)
+    q = torch.rand(B, T, H, D, dtype=dtype)
+    k = torch.rand(B, T, H, D, dtype=dtype)
+    v = torch.rand(B, T, HV, D, dtype=dtype)
+    g = torch.randn(B, T, HV, D, dtype=torch.float if not use_gate_in_kernel else dtype)
+    if use_gate_in_kernel:
+        A_log = torch.randn(HV, dtype=torch.float)
+        dt_bias = torch.randn(HV * D, dtype=torch.float)
+    else:
+        g = F.logsigmoid(g) / gate_logit_normalizer
+        g = g * (torch.rand_like(g) > mask_p)
+    if safe_gate:
+        lower_bound = -5.0
+        if not use_gate_in_kernel:
+            g = g.clamp(-5, 0)
+        naive_kda_gate_fn = naive_kda_lowerbound_gate
+    else:
+        lower_bound = None
+        naive_kda_gate_fn = naive_kda_gate
 
+    beta = torch.randn(B, T, HV, dtype=torch.float32).sigmoid().to(beta_dtype)
+    h0 = torch.randn(B, HV, D, D, dtype=torch.float32)
+    # NOTE: for inference scenarios, we only use transposed state layout for better decoding performance
+    h0_vk = h0.transpose(-1, -2).contiguous()
+    if use_gate_in_kernel:
+        A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(False), (A_log, dt_bias))
+    q, k, v, g, beta, h0, h0_vk = map(lambda x: x.to(device).requires_grad_(False), (q, k, v, g, beta, h0, h0_vk))
+    initial_state = h0.clone() if use_initial_state else None
+    initial_state_vk = h0_vk.clone() if use_initial_state else None
 
-# ============================================================
-# Helpers
-# ============================================================
-def time_kernel(fn, warmup=None, n_iters=None):
-    if warmup is None:
-        warmup = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
-    if n_iters is None:
-        n_iters = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    start_evt.record()
-    for _ in range(n_iters):
-        fn()
-    end_evt.record()
-    torch.cuda.synchronize()
-    return start_evt.elapsed_time(end_evt) / n_iters
+    heads_per_group = HV // H
+    q_ref = q.repeat_interleave(heads_per_group, dim=2)
+    k_ref = k.repeat_interleave(heads_per_group, dim=2)
 
-
-def accuracy_stats(ref, out):
-    """Compute RMSE, relative max diff, and mean absolute difference."""
-    ref_f = ref.float()
-    out_f = out.float()
-    diff = (ref_f - out_f).abs()
-    rmse = diff.pow(2).mean().sqrt().item()
-    max_diff = diff.max().item()
-    denom = ref_f.abs().max().item()
-    rel_max = max_diff / denom if denom > 0 else 0.0
-    mean_diff = diff.mean().item()
-    return rmse, rel_max, mean_diff
-
-
-def run_fla(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, lower_bound):
-    return fla_chunk_kda(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        scale=scale,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        initial_state=init_state,
+    ref, ref_ht = naive_recurrent_kda(
+        q=F.normalize(q_ref.clone(), p=2, dim=-1),
+        k=F.normalize(k_ref.clone(), p=2, dim=-1),
+        v=v.clone(),
+        g=(naive_kda_gate_fn(g, A_log, dt_bias) if use_gate_in_kernel else g.clone()),
+        beta=beta.clone(),
+        initial_state=initial_state,
         output_final_state=True,
-        use_qk_l2norm_in_kernel=True,
-        cu_seqlens=cu_seqlens,
-        use_gate_in_kernel=True,
-        safe_gate=True,
+    )
+
+    ref_fla, ref_ht_fla = fla_chunk_kda(
+        q=F.normalize(q_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q_ref.clone(),
+        k=F.normalize(k_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k_ref.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        A_log=(A_log.clone() if use_gate_in_kernel else None),
+        dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
+        initial_state=initial_state,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+    )
+
+    ref_fla_trans, ref_ht_fla_trans = fla_chunk_kda(
+        q=F.normalize(q_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q_ref.clone(),
+        k=F.normalize(k_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k_ref.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        A_log=(A_log.clone() if use_gate_in_kernel else None),
+        dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
+        initial_state=initial_state_vk,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate,
         lower_bound=lower_bound,
         transpose_state_layout=True,
     )
 
-
-def run_cula(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, lower_bound):
-    return cula_kda_fused_fwd(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        scale=scale,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        initial_state=init_state,
+    tri, tri_ht = cula_kda_fused_fwd(
+        q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
+        k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        A_log=(A_log.clone() if use_gate_in_kernel else None),
+        dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
+        initial_state=initial_state_vk,
         output_final_state=True,
-        use_qk_l2norm_in_kernel=True,
-        cu_seqlens=cu_seqlens,
-        use_gate_in_kernel=True,
-        safe_gate=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate,
         lower_bound=lower_bound,
     )
 
+    assert_close("o", ref, tri, 0.005)
+    assert_close("o", ref_fla, tri, 0.005)
+    assert_close("o", ref_fla_trans, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
+    assert_close("ht", ref_ht_fla, tri_ht.transpose(-1, -2), 0.005)
+    assert_close("ht", ref_ht_fla_trans, tri_ht, 0.005)
 
-# ============================================================
-# Fixed-length benchmark
-# ============================================================
-def bench_fixed(configs):
-    print("\n" + "=" * 100)
-    print(f" Fixed-Length Benchmark: cuLA fully-fused ({_SM_TAG}) vs FLA Triton")
-    print("=" * 100)
-    results = []
 
-    for B, T in configs:
-        set_seed(SEED)
-        device = torch.device("cuda")
-        torch.cuda.empty_cache()
-
-        seq_lens = [T] * B
-        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
-
-        inputs = prepare_safe_gate_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens, has_init_state=HAS_INIT_STATE)
-        q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
-        A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
-        scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
-
-        common = dict(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            init_state=init_state,
-            cu_seqlens=cu_seqlens,
-            lower_bound=lower_bound,
+@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
+@pytest.mark.parametrize(
+    ("H", "HV", "D", "mask_p", "cu_seqlens", "dtype", "safe_gate", "use_initial_state"),
+    [
+        pytest.param(
+            *test,
+            id="H{}-HV{}-D{}-mask_p{}-cu_seqlens{}-{}-safe_gate{}-init{}".format(*test),
         )
+        for test in [
+            (4, 4, 128, 0.1, [0, 15], torch.bfloat16, True, True),
+            (4, 4, 128, 0.9, [0, 256, 500, 1000], torch.bfloat16, True, True),
+            (4, 4, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True, True),
+            (4, 4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16, True, True),
+            (4, 4, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True, True),
+            (2, 4, 128, 0, [0, 63, 130], torch.bfloat16, True, True),
+            (1, 2, 128, 0, [0, 1], torch.bfloat16, True, True),
+            (1, 2, 128, 0, [0, 63, 64, 65], torch.bfloat16, True, True),
+            (2, 4, 128, 0, [0, 17, 64, 65, 130], torch.bfloat16, True, False),
+            # ======Varlen test with simulated trace=======
+            (
+                32,
+                32,
+                128,
+                0,
+                [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192],
+                torch.bfloat16,
+                True,
+                True,
+            ),
+            (
+                32,
+                32,
+                128,
+                0,
+                [0, 652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236, 5543, 6255, 6480, 6947, 7616, 8192],
+                torch.bfloat16,
+                True,
+                True,
+            ),
+            (
+                32,
+                32,
+                128,
+                0,
+                [0, 315, 973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459, 6318, 6669, 6979, 7583, 8192],
+                torch.bfloat16,
+                True,
+                True,
+            ),
+            (
+                32,
+                32,
+                128,
+                0,
+                [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
+                torch.bfloat16,
+                True,
+                True,
+            ),
+        ]
+    ],
+)
+def test_safe_gate_chunk_varlen(
+    H: int,
+    HV: int,
+    D: int,
+    mask_p: float,
+    cu_seqlens: list[int],
+    dtype: torch.dtype,
+    safe_gate: bool,
+    use_initial_state: bool,
+    beta_dtype: torch.dtype,
+):
+    cula_kda_fused_fwd = get_kda_fused_fwd(device)
 
-        # Accuracy
-        o_fla, _ = run_fla(**common)
-        o_cula, _ = run_cula(**common)
-        torch.cuda.synchronize()
+    torch.manual_seed(42)
+    cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    cu_seqlens_cpu = cu_seqlens.cpu()
+    T = cu_seqlens[-1]
+    N = len(cu_seqlens) - 1
 
-        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
+    q = torch.randn((1, T, H, D), dtype=dtype)
+    k = F.normalize(torch.randn(1, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
+    v = torch.randn((1, T, HV, D), dtype=dtype)
+    g = F.logsigmoid(torch.randn(1, T, HV, D, dtype=torch.float))
+    mask = torch.rand_like(g) > mask_p
+    g = g * mask + (~mask) * (-1000)
+    if safe_gate:
+        g = g.clamp(-5, 0)
 
-        # Performance
-        ms_fla = time_kernel(lambda: run_fla(**common))
-        ms_cula = time_kernel(lambda: run_cula(**common))
-        speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
+    beta = torch.randn(1, T, HV, dtype=torch.float32).sigmoid().to(beta_dtype)
+    h0 = torch.randn((N, HV, D, D), dtype=torch.float32)
+    # NOTE: for inference scenarios, we only use transposed state layout for better decoding performance
+    h0_vk = h0.transpose(-1, -2).contiguous()
 
-        results.append(
-            {
-                "B": B,
-                "T": T,
-                "rmse": rmse,
-                "rel_max": rel_max,
-                "mean_diff": mean_diff,
-                "ms_fla": ms_fla,
-                "ms_cula": ms_cula,
-                "speedup": speedup,
-            }
-        )
+    q, k, v, g, beta, h0, h0_vk = map(lambda x: x.to(device).requires_grad_(False), (q, k, v, g, beta, h0, h0_vk))
+    initial_state = h0.clone() if use_initial_state else None
+    initial_state_vk = h0_vk.clone() if use_initial_state else None
+    heads_per_group = HV // H
+    q_ref = q.repeat_interleave(heads_per_group, dim=2)
+    k_ref = k.repeat_interleave(heads_per_group, dim=2)
 
-        del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
-        torch.cuda.empty_cache()
-
-    return results
-
-
-# ============================================================
-# Varlen benchmark
-# ============================================================
-def bench_varlen(configs):
-    print("\n" + "=" * 100)
-    print(f" Varlen Benchmark: cuLA fully-fused ({_SM_TAG}) vs FLA Triton")
-    print("=" * 100)
-    results = []
-
-    for seq_lens, total_len, dist in configs:
-        set_seed(SEED)
-        device = torch.device("cuda")
-        torch.cuda.empty_cache()
-
-        T = total_len
-        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
-
-        inputs = prepare_safe_gate_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens, has_init_state=HAS_INIT_STATE)
-        q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
-        A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
-        scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
-
-        common = dict(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            init_state=init_state,
-            cu_seqlens=cu_seqlens,
-            lower_bound=lower_bound,
-        )
-
-        # Accuracy
-        o_fla, _ = run_fla(**common)
-        o_cula, _ = run_cula(**common)
-        torch.cuda.synchronize()
-
-        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
-
-        # Performance
-        ms_fla = time_kernel(lambda: run_fla(**common))
-        ms_cula = time_kernel(lambda: run_cula(**common))
-        speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
-
-        n_seqs = len(seq_lens)
-        min_l, max_l = min(seq_lens), max(seq_lens)
-        avg_l = T // n_seqs
-        tag = f"{dist:>7s} {n_seqs:>2d}seqs T={T} [{min_l}..{max_l}] avg={avg_l}"
-
-        results.append(
-            {
-                "tag": tag,
-                "dist": dist,
-                "T_total": T,
-                "n_seqs": n_seqs,
-                "rmse": rmse,
-                "rel_max": rel_max,
-                "mean_diff": mean_diff,
-                "ms_fla": ms_fla,
-                "ms_cula": ms_cula,
-                "speedup": speedup,
-            }
-        )
-
-        del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
-        torch.cuda.empty_cache()
-
-    return results
-
-
-# ============================================================
-# Report
-# ============================================================
-def print_report(fixed_results, varlen_results):
-    sep = "=" * 110
-    print(f"\n\n{sep}")
-    print("                  BENCHMARK REPORT: cula_kda_fused_fwd (fully-fused)")
-    print(f"                  cuLA {_SM_TAG} fully-fused vs FLA Triton")
-    print(f"                  H={H}  D={D}  dtype=bf16  safe_gate=True  has_init_state={HAS_INIT_STATE}")
-    wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
-    ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
-    mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
-    print(f"                  Warmup={wu}  Iters={ni}{mode_tag}")
-    print(sep)
-
-    if fixed_results:
-        print("\n  [Fixed-Length]")
-        print(f"  {'─' * 90}")
-        print(
-            f"  {'B':>3s}  {'T':>6s}  │  {'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}"
-            f"  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
-        )
-        print(f"  {'─' * 90}")
-        for r in fixed_results:
-            print(
-                f"  {r['B']:3d}  {r['T']:6d}  │  "
-                f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
-                f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x"
-            )
-        print(f"  {'─' * 90}")
-
-    if varlen_results:
-        print("\n  [Varlen]")
-        print(f"  {'─' * 105}")
-        print(
-            f"  {'Config':>45s}  │  {'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}"
-            f"  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
-        )
-        print(f"  {'─' * 105}")
-        for r in varlen_results:
-            print(
-                f"  {r['tag']:>45s}  │  "
-                f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
-                f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x"
-            )
-        print(f"  {'─' * 105}")
-
-    print(f"\n{sep}\n")
-
-
-# ============================================================
-# Main
-# ============================================================
-def main():
-    parser = argparse.ArgumentParser(description="bench_kda_fused_fwd: cuLA fully-fused KDA forward vs FLA Triton")
-    parser.add_argument(
-        "--mode",
-        type=str,
-        default="both",
-        choices=["fixed", "varlen", "both"],
-        help="Which benchmark mode to run (default: both)",
-    )
-    parser.add_argument(
-        "--ncu",
-        action="store_true",
-        help="NCU profiling mode: warmup=1, iters=1",
-    )
-    parser.add_argument(
-        "--sanitizer",
-        action="store_true",
-        help="Sanitizer mode: warmup=1, iters=1",
-    )
-    parser.add_argument(
-        "--init_state",
-        action="store_true",
-        help="Use non-zero initial state (default: False)",
-    )
-    args = parser.parse_args()
-
-    global NCU_MODE, SANITIZER_MODE, HAS_INIT_STATE
-    if args.ncu:
-        NCU_MODE = True
-        print("[NCU mode] warmup=1, iters=1")
-    if args.sanitizer:
-        SANITIZER_MODE = True
-        print("[Sanitizer mode] warmup=1, iters=1")
-    if args.init_state:
-        HAS_INIT_STATE = True
-        print("[init_state] using non-zero initial state")
-
-    print(
-        f"[Device] {torch.cuda.get_device_name(0)}  compute capability {_SM_TAG}  →  using {cula_kda_fused_fwd.__module__}.{cula_kda_fused_fwd.__name__}"
+    tri, tri_ht = cula_kda_fused_fwd(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        initial_state=initial_state_vk,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        safe_gate=safe_gate,
+        lower_bound=-5.0 if safe_gate else None,
     )
 
-    fixed_configs = [
-        # (B, T)
-        (1, 512),
-        (1, 1024),
-        (1, 4096),
-        (1, 8192),
-        (1, 16384),
-        (2, 512),
-        (2, 1024),
-        (2, 4096),
-        (2, 8192),
-        (2, 16384),
-    ]
-
-    varlen_configs = build_varlen_configs(
-        num_seqs_list=(10, 20),
-        total_lens=(4096, 8192, 16384),
-        dists=("uniform", "random", "skewed"),
+    ref_fla, ref_ht_fla = fla_chunk_kda(
+        q=F.normalize(q_ref.clone(), p=2, dim=-1),
+        k=k_ref.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        initial_state=initial_state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        safe_gate=safe_gate,
+        lower_bound=-5.0 if safe_gate else None,
     )
 
-    fixed_res, varlen_res = [], []
+    ref_fla_trans, ref_ht_fla_trans = fla_chunk_kda(
+        q=F.normalize(q_ref.clone(), p=2, dim=-1),
+        k=k_ref.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        initial_state=initial_state_vk,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        safe_gate=safe_gate,
+        lower_bound=-5.0 if safe_gate else None,
+        transpose_state_layout=True,
+    )
 
-    if args.mode in ("fixed", "both"):
-        fixed_res = bench_fixed(fixed_configs)
+    ref = []
+    ref_ht = []
+    for i in range(N):
+        ref_i, ref_ht_i = naive_recurrent_kda(
+            q=F.normalize(q_ref[:, cu_seqlens[i] : cu_seqlens[i + 1]], p=2, dim=-1),
+            k=k_ref[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            v=v[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            beta=beta[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            g=g[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            initial_state=h0[i] if use_initial_state else None,
+            output_final_state=True,
+        )
+        ref.append(ref_i)
+        ref_ht.append(ref_ht_i)
+    ref = torch.cat(ref, 1)
+    ref_ht = torch.cat(ref_ht, 0)
 
-    if args.mode in ("varlen", "both"):
-        varlen_res = bench_varlen(varlen_configs)
-
-    print_report(fixed_res, varlen_res)
-
-    return fixed_res, varlen_res
-
-
-if __name__ == "__main__":
-    main()
+    assert_close("o", ref, tri, 0.005)
+    assert_close("o", ref_fla, tri, 0.005)
+    assert_close("o", ref_fla_trans, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
+    assert_close("ht", ref_ht_fla, tri_ht.transpose(-1, -2), 0.005)
+    assert_close("ht", ref_ht_fla_trans, tri_ht, 0.005)
