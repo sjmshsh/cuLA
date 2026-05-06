@@ -24,7 +24,7 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 import cula.cudac as cula_cuda
 from cula.utils import _get_cache_buf, assert_hopper, get_device_sm_count, prepare_uniform_cu_seqlens
 
-
+# PyTorch 的自动求导只能追踪纯 PyTorch 操作。一旦你调了自定义 CUDA 算子（cula_cuda.kda_fwd_prefill），autograd 图就断了。要想让这个算子和上层网络一起训练，必须继承 torch.autograd.Function 手动声明 forward + backward。
 class HopperChunkKDAFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
@@ -49,9 +49,21 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         chunk_indices: torch.IntTensor | None = None,
     ):
         chunk_size = 64
-        assert q.shape[-2] == v.shape[-2] == k.shape[-2], "Number of heads must be the same for q, k, v."
+        # GVA: q/k share num_qk_heads; v/g/beta share num_v_heads.
+        # num_v_heads must be a positive multiple of num_qk_heads (heads_per_group = HV / H).
+        assert q.shape == k.shape, "q and k must have the same shape."
+        assert q.shape[:2] == v.shape[:2] == g.shape[:2], (
+            "q, k, v, g must share batch and sequence dimensions."
+        )
 
-        batch_size, seq_len, num_heads, head_dim = q.shape
+        batch_size, seq_len, num_qk_heads, head_dim = q.shape
+        num_v_heads = v.shape[-2]
+        # Order matters: enforce positivity *before* the modulo so we never % 0.
+        assert num_qk_heads > 0, f"num_qk_heads must be positive, got {num_qk_heads}."
+        assert num_v_heads > 0, f"num_v_heads must be positive, got {num_v_heads}."
+        assert num_v_heads % num_qk_heads == 0, (
+            f"num_v_heads ({num_v_heads}) must be a positive multiple of num_qk_heads ({num_qk_heads})."
+        )
 
         if cu_seqlens is None:
             cu_seqlens = prepare_uniform_cu_seqlens(batch_size, seq_len, q.device, torch.int32)
@@ -61,7 +73,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
             q, k, v, g, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g, beta))
 
         # gate preprocessing
-        if use_gate_in_kernel:
+        if use_gate_in_kernel: ## 让 KDA kernel 代办 gate 的全套预处理（激活 + clamp + cumsum），还是只让它做最后一步 cumsum。
             if safe_gate:
                 assert lower_bound is not None, "lower_bound must be set when use safe_gate"
             g = kda_gate_chunk_cumsum(
@@ -88,13 +100,13 @@ class HopperChunkKDAFunction(torch.autograd.Function):
             q, q_rstd = l2norm_fwd(q)
             k, k_rstd = l2norm_fwd(k)
 
-        # reshape to packed [T, H, K] for the C++ kernel
+        # reshape to packed [T, H, D] / [T, HV, D] for the C++ kernel
         packed_seq = batch_size * seq_len
-        q = q.reshape(packed_seq, num_heads, head_dim).contiguous()
-        k = k.reshape(packed_seq, num_heads, head_dim).contiguous()
-        v = v.reshape(packed_seq, num_heads, head_dim).contiguous()
-        g = g.reshape(packed_seq, num_heads, head_dim).contiguous()
-        beta = beta.reshape(packed_seq, num_heads).contiguous()
+        q = q.reshape(packed_seq, num_qk_heads, head_dim).contiguous()
+        k = k.reshape(packed_seq, num_qk_heads, head_dim).contiguous()
+        v = v.reshape(packed_seq, num_v_heads, head_dim).contiguous()
+        g = g.reshape(packed_seq, num_v_heads, head_dim).contiguous()
+        beta = beta.reshape(packed_seq, num_v_heads).contiguous()
 
         # workspace buffer for TMA Store O tensormap
         sm_count = get_device_sm_count(q.device)
@@ -121,7 +133,10 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         # reshape back
         o = rearrange(o, "(b t) h d -> b t h d", b=batch_size)
 
-        return o.to(q.dtype), final_state
+        # Bug fix: respect output_final_state=False explicitly.
+        # The C++ kernel always allocates an output_state tensor, but the public API
+        # promises None when the caller did not opt-in.
+        return o.to(q.dtype), (final_state if output_final_state else None)
 
     @staticmethod
     @input_guard
@@ -153,23 +168,23 @@ def cula_kda_prefill(
 
     Args:
         q (torch.Tensor):
-            queries of shape `[B, T, H, K]`.
+            queries of shape `[B, T, H, D]`.
         k (torch.Tensor):
-            keys of shape `[B, T, H, K]`.
+            keys of shape `[B, T, H, D]`.
         v (torch.Tensor):
-            values of shape `[B, T, H, V]`.
+            values of shape `[B, T, HV, D]`.
         g (torch.Tensor):
-            (forget) gating tensor (in log space!) of shape `[B, T, H, K]`.
+            (forget) gating tensor (in log space!) of shape `[B, T, HV, D]`.
         beta (torch.Tensor):
-            betas of shape `[B, T, H]`.
+            betas of shape `[B, T, HV]`.
         scale (Optional[float]):
             Scale factor for the KDA attention scores.
-            If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
+            If not provided, it will default to `1 / sqrt(D)`. Default: `None`.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[N, H, K, V]` for `N` input sequences.
+            Initial state of shape `[N, HV, D, D]` for `N` input sequences.
             Default: `None`.
         output_final_state (Optional[bool]):
-            Whether to output the final state of shape `[N, H, K, V]`. Default: `False`.
+            Whether to output the final state of shape `[N, HV, D, D]`. Default: `False`.
         use_qk_l2norm_in_kernel (bool):
             Whether to apply L2norm to the q,k tensor internally. Default: `False`.
         use_gate_in_kernel (bool):
@@ -187,9 +202,15 @@ def cula_kda_prefill(
 
     Returns:
         o (torch.Tensor):
-            Outputs of shape `[B, T, H, V]`.
+            Outputs of shape `[B, T, HV, D]`.
         final_state (torch.Tensor):
-            Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
+            Final state of shape `[N, HV, D, D]` if `output_final_state=True` else `None`.
+
+    GVA constraint:
+        - q.shape == k.shape == [B, T, H, D]
+        - v.shape == g.shape == [B, T, HV, D], beta.shape == [B, T, HV]
+        - HV must be a positive multiple of H. heads_per_group = HV // H.
+        - When HV == H this degenerates to the regular MHA case.
     """
     assert_hopper()
     assert safe_gate, "Only support safe_gate=True."
@@ -217,9 +238,34 @@ def cula_kda_prefill(
             if not (-5 <= lower_bound < 0):
                 raise ValueError(f"`lower_bound` must be in the safe range [-5, 0), got {lower_bound}.")
 
-    assert q.shape == k.shape == g.shape, "q, k, g must have the same shape."
-    assert beta.shape == q.shape[:3], "beta must be of shape (batch size, seq len, num of head)."
-    assert v.shape == (*q.shape[:3], v.shape[-1]), "v must be of shape (batch size, seq len, num of head, head dim)."
+    assert q.shape == k.shape, "q and k must have the same shape."
+    assert q.shape[:2] == v.shape[:2] == g.shape[:2], (
+        "q, k, v, g must share batch and sequence dimensions."
+    )
+
+    batch_size, seq_len, num_qk_heads, head_dim = q.shape
+    num_v_heads = v.shape[-2]
+    # Order matters here: positivity *first*, modulo second, to avoid ZeroDivisionError on bad inputs.
+    assert num_qk_heads > 0, f"num_qk_heads must be positive, got {num_qk_heads}."
+    assert num_v_heads > 0, f"num_v_heads must be positive, got {num_v_heads}."
+    assert num_v_heads % num_qk_heads == 0, (
+        f"num_v_heads ({num_v_heads}) must be a positive multiple of num_qk_heads ({num_qk_heads})."
+    )
+    assert g.shape == (batch_size, seq_len, num_v_heads, head_dim), (
+        f"g must have shape (B, T, HV, D)=({batch_size}, {seq_len}, {num_v_heads}, {head_dim}), got {tuple(g.shape)}."
+    )
+    assert v.shape == (batch_size, seq_len, num_v_heads, head_dim), (
+        f"v must have shape (B, T, HV, D)=({batch_size}, {seq_len}, {num_v_heads}, {head_dim}), got {tuple(v.shape)}."
+    )
+    assert beta.shape == (batch_size, seq_len, num_v_heads), (
+        f"beta must have shape (B, T, HV)=({batch_size}, {seq_len}, {num_v_heads}), got {tuple(beta.shape)}."
+    )
+    if initial_state is not None:
+        expected_num_states = (len(cu_seqlens) - 1) if cu_seqlens is not None else batch_size
+        assert initial_state.shape == (expected_num_states, num_v_heads, head_dim, head_dim), (
+            f"initial_state must have shape (N, HV, D, D)="
+            f"({expected_num_states}, {num_v_heads}, {head_dim}, {head_dim}), got {tuple(initial_state.shape)}."
+        )
     assert q.dtype == k.dtype == v.dtype == torch.bfloat16, "q, k, v must be in bfloat16."
     assert beta.dtype == torch.bfloat16 or beta.dtype == torch.float32, "beta must be in bfloat16 or float32."
     assert q.shape[-1] == k.shape[-1] == v.shape[-1] == 128, "Currently we only support head dim of 128 for KDA"
