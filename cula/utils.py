@@ -80,7 +80,6 @@ def assert_hopper(device: torch.device | str | int | None = None) -> None:
         raise RuntimeError(f"Only Hopper GPUs (SM90) are supported, got compute capability sm_{major}{minor}.")
 
 
-## 这是一个按GPU架构自动分派前向kernel的工厂函数， 根据当前使用的CUDA GPU SM版本，返回一个匹配该硬件的kda_prefill实现函数
 def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callable:
     """Return the appropriate ``kda_prefill`` implementation for *device*.
 

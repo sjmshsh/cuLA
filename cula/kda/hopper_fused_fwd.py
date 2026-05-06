@@ -24,7 +24,6 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 import cula.cudac as cula_cuda
 from cula.utils import _get_cache_buf, assert_hopper, get_device_sm_count, prepare_uniform_cu_seqlens
 
-# PyTorch 的自动求导只能追踪纯 PyTorch 操作。一旦你调了自定义 CUDA 算子（cula_cuda.kda_fwd_prefill），autograd 图就断了。要想让这个算子和上层网络一起训练，必须继承 torch.autograd.Function 手动声明 forward + backward。
 class HopperChunkKDAFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
@@ -73,7 +72,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
             q, k, v, g, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g, beta))
 
         # gate preprocessing
-        if use_gate_in_kernel: ## 让 KDA kernel 代办 gate 的全套预处理（激活 + clamp + cumsum），还是只让它做最后一步 cumsum。
+        if use_gate_in_kernel:
             if safe_gate:
                 assert lower_bound is not None, "lower_bound must be set when use safe_gate"
             g = kda_gate_chunk_cumsum(
