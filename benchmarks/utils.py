@@ -256,25 +256,77 @@ def build_varlen_configs(
 
 
 def prepare_safe_gate_inputs(
-    batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED, has_init_state=False
+    batch_size,
+    T,
+    H,
+    D,
+    device,
+    cu_seqlens=None,
+    chunk_size=CHUNK_SIZE,
+    seed=SEED,
+    has_init_state=False,
+    num_v_heads=None,
 ):
     """Prepare inputs for safe_gate benchmarks (use_gate_in_kernel=True, safe_gate=True).
 
+    Args:
+        batch_size: Batch size `B`.
+        T: Per-sequence length.
+        H: Number of Q/K heads (the "group" count, must be > 0).
+        D: Head dimension.
+        device: torch device.
+        cu_seqlens: Optional cumulative sequence lengths for varlen.
+        chunk_size: Chunk size for `prepare_chunk_indices`.
+        seed: RNG seed.
+        has_init_state: Whether to allocate a non-zero initial state.
+        num_v_heads: Optional number of V heads (HV). Defaults to `H` (no GVA).
+            When `HV > H`, GVA (Grouped Value Attention) is enabled:
+              - v/g/beta are allocated with HV heads.
+              - q/k/g/beta are expanded from H to HV heads via
+                `repeat_interleave(..., dim=head)`, equivalent to the einops
+                pattern `repeat(x, "... h d -> ... (h g) d")` used by
+                `fla.layers.kda`.
+              - `A_log` / `dt_bias` are sized to HV because FLA's
+                `kda_gate_chunk_cumsum` indexes them per head of `g`.
+            This expanded layout works on both cuLA backends (SM100 requires
+            q.shape[-2] == v.shape[-2]; SM90 accepts both native and expanded
+            GVA) and on FLA's `chunk_kda` (which does not natively support GVA).
+
     All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
+    The returned dict always contains `H` and `HV` keys so callers can report
+    the effective head counts uniformly.
     """
+    HV = H if num_v_heads is None else num_v_heads
+    assert H > 0, f"H must be positive, got {H}."
+    assert HV > 0, f"HV must be positive, got {HV}."
+    assert HV % H == 0, f"HV ({HV}) must be a positive multiple of H ({H})."
+
     dtype = torch.bfloat16
     scale = D ** (-0.5)
 
     set_seed(seed)
 
+    # Allocate native GVA shapes:
+    #   q, k: (B, T, H, D)
+    #   v, g: (B, T, HV, D)
+    #   beta: (B, T, HV)
+    # When HV == H this collapses to the standard non-GVA layout.
     q = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
     k = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    v = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    g = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    beta = torch.randn(batch_size, T, H, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
+    v = torch.randn(batch_size, T, HV, D, dtype=dtype, device=device).requires_grad_(False)
+    g = torch.randn(batch_size, T, HV, D, dtype=dtype, device=device).requires_grad_(False)
+    beta = torch.randn(batch_size, T, HV, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
 
-    A_log = torch.randn(H, dtype=torch.float, device=device).requires_grad_(False)
-    dt_bias = torch.randn(H * D, dtype=torch.float, device=device).requires_grad_(False)
+    # GVA expansion: bring q/k up to HV heads so all tensors share head dim.
+    group = HV // H
+    if group > 1:
+        q = q.repeat_interleave(group, dim=2).contiguous()
+        k = k.repeat_interleave(group, dim=2).contiguous()
+
+    # A_log / dt_bias must match the head count of `g` (HV), otherwise
+    # kda_gate_chunk_cumsum would index out of bounds for i_h >= H.
+    A_log = torch.randn(HV, dtype=torch.float, device=device).requires_grad_(False)
+    dt_bias = torch.randn(HV * D, dtype=torch.float, device=device).requires_grad_(False)
 
     # flatten to batch_size=1 for cu_seqlens compatibility
     if batch_size != 1:
@@ -285,7 +337,7 @@ def prepare_safe_gate_inputs(
     init_state = None
     if has_init_state:
         num_seqs = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else batch_size
-        init_state = torch.randn(num_seqs, H, D, D, dtype=torch.float, device=device).requires_grad_(False)
+        init_state = torch.randn(num_seqs, HV, D, D, dtype=torch.float, device=device).requires_grad_(False)
 
     return dict(
         q=q,
@@ -300,6 +352,8 @@ def prepare_safe_gate_inputs(
         chunk_indices=chunk_indices,
         init_state=init_state,
         lower_bound=-5.0,
+        H=H,
+        HV=HV,
     )
 
 
