@@ -25,23 +25,23 @@ Compares:
   - Accuracy: RMSE, relative max diff between cuLA fully-fused and FLA Triton
   - Performance: kernel execution time (ms) with CUDA events
 
-Modes (each config carries its own (H, HV); GVA is enabled when HV > H):
-  - Fixed-length: various (B, T, H, HV) configs.
-  - Varlen:       sequences with 2-3x length variation, per-config (H, HV).
+Modes:
+  - Fixed-length: various (B, T) configs; a small GVA supplement uses (B, T, H, HV).
+  - Varlen:       sequences with realistic length variation; a few GVA configs included.
 
-Under GVA (HV > H), q/k/g/beta are expanded from H to HV heads via
-`repeat(..., "... h d -> ... (h g) d")`. This keeps FLA's `chunk_kda`
-(which does not natively support GVA) and cuLA's SM100 fully-fused forward
-(which requires q/k/v to share the head dim) on the same input layout.
+Each config may carry an explicit (H_qk, HV) pair to enable GVA (HV > H).
+Under GVA, q/k/g/beta are expanded from H to HV heads so that both FLA and
+cuLA operate on the same input layout.
 
 Usage:
-  python bench_kda_fused_fwd.py [--mode fixed|varlen|both|all] [--ncu]
+  python bench_kda_fused_fwd.py [--mode fixed|varlen|both] [--ncu]
 
 With --ncu, warmup=1 and iters=1 for ncu profiling:
   ncu --set full -o report python bench_kda_fused_fwd.py --mode varlen --ncu
 """
 
 import argparse
+import datetime
 import os
 import pathlib
 import sys
@@ -56,6 +56,7 @@ from benchmarks.utils import (
     SEED,
     build_varlen_configs,
     exclusive_cumsum,
+    prepare_gva_inputs,
     prepare_safe_gate_inputs,
     set_seed,
 )
@@ -193,7 +194,7 @@ def _normalize_varlen_config(cfg):
 # ============================================================
 def bench_fixed(configs):
     print("\n" + "=" * 100)
-    print(f" Fixed-Length Benchmark: cuLA fully-fused ({_SM_TAG}) vs FLA Triton  (GVA when HV > H)")
+    print(f" Fixed-Length Benchmark: cuLA fully-fused ({_SM_TAG}) vs FLA Triton")
     print("=" * 100)
     results = []
 
@@ -206,31 +207,32 @@ def bench_fixed(configs):
         seq_lens = [T] * B
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-        inputs = prepare_safe_gate_inputs(
-            B, T, H_qk, D, device,
-            cu_seqlens=cu_seqlens,
-            has_init_state=HAS_INIT_STATE,
-            num_v_heads=HV,
-        )
+        if HV > H_qk:
+            inputs = prepare_gva_inputs(
+                B, T, H_qk, HV, D, device,
+                cu_seqlens=cu_seqlens,
+                has_init_state=HAS_INIT_STATE,
+            )
+        else:
+            inputs = prepare_safe_gate_inputs(
+                B, T, H_qk, D, device,
+                cu_seqlens=cu_seqlens,
+                has_init_state=HAS_INIT_STATE,
+            )
         q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
         A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
         scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
 
         common = dict(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            init_state=init_state,
-            cu_seqlens=cu_seqlens,
-            lower_bound=lower_bound,
+            q=q, k=k, v=v, g=g, beta=beta,
+            scale=scale, A_log=A_log, dt_bias=dt_bias,
+            init_state=init_state, cu_seqlens=cu_seqlens, lower_bound=lower_bound,
         )
 
-        # Accuracy
+        # Accuracy: run once to warm up JIT, then measure on the second call
+        run_fla(**common)
+        run_cula(**common)
+        torch.cuda.synchronize()
         o_fla, _ = run_fla(**common)
         o_cula, _ = run_cula(**common)
         torch.cuda.synchronize()
@@ -258,6 +260,7 @@ def bench_fixed(configs):
         )
 
         del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
+        del common, scale, init_state, lower_bound, cu_seqlens
         torch.cuda.empty_cache()
 
     return results
@@ -268,7 +271,7 @@ def bench_fixed(configs):
 # ============================================================
 def bench_varlen(configs):
     print("\n" + "=" * 100)
-    print(f" Varlen Benchmark: cuLA fully-fused ({_SM_TAG}) vs FLA Triton  (GVA when HV > H)")
+    print(f" Varlen Benchmark: cuLA fully-fused ({_SM_TAG}) vs FLA Triton")
     print("=" * 100)
     results = []
 
@@ -281,12 +284,18 @@ def bench_varlen(configs):
         T = total_len
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-        inputs = prepare_safe_gate_inputs(
-            1, T, H_qk, D, device,
-            cu_seqlens=cu_seqlens,
-            has_init_state=HAS_INIT_STATE,
-            num_v_heads=HV,
-        )
+        if HV > H_qk:
+            inputs = prepare_gva_inputs(
+                1, T, H_qk, HV, D, device,
+                cu_seqlens=cu_seqlens,
+                has_init_state=HAS_INIT_STATE,
+            )
+        else:
+            inputs = prepare_safe_gate_inputs(
+                1, T, H_qk, D, device,
+                cu_seqlens=cu_seqlens,
+                has_init_state=HAS_INIT_STATE,
+            )
         q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
         A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
         scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
@@ -305,7 +314,10 @@ def bench_varlen(configs):
             lower_bound=lower_bound,
         )
 
-        # Accuracy
+        # Accuracy: run once to warm up JIT, then measure on the second call
+        run_fla(**common)
+        run_cula(**common)
+        torch.cuda.synchronize()
         o_fla, _ = run_fla(**common)
         o_cula, _ = run_cula(**common)
         torch.cuda.synchronize()
@@ -340,6 +352,7 @@ def bench_varlen(configs):
         )
 
         del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
+        del common, scale, init_state, lower_bound, cu_seqlens
         torch.cuda.empty_cache()
 
     return results
@@ -350,6 +363,7 @@ def bench_varlen(configs):
 # ============================================================
 def print_report(fixed_results, varlen_results):
     sep = "=" * 120
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n\n{sep}")
     print("                  BENCHMARK REPORT: cula_kda_fused_fwd (fully-fused)")
     print(f"                  cuLA {_SM_TAG} fully-fused vs FLA Triton")
@@ -359,6 +373,7 @@ def print_report(fixed_results, varlen_results):
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
     mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
     print(f"                  Warmup={wu}  Iters={ni}{mode_tag}")
+    print(f"                  {ts}")
     print(sep)
 
     if fixed_results:
@@ -370,8 +385,13 @@ def print_report(fixed_results, varlen_results):
             f"{'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 110}")
+        prev_gva = False
         for r in fixed_results:
-            gva_tag = "yes" if r["HV"] > r["H"] else "no"
+            is_gva = r["HV"] > r["H"]
+            if is_gva and not prev_gva:
+                print(f"  {'·' * 110}  ← GVA (HV > H)")
+            prev_gva = is_gva
+            gva_tag = "yes" if is_gva else "no"
             print(
                 f"  {r['B']:3d}  {r['T']:6d}  {r['H']:3d}  {r['HV']:3d}  {gva_tag:>4s}  │  "
                 f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
@@ -388,8 +408,13 @@ def print_report(fixed_results, varlen_results):
             f"{'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 120}")
+        prev_gva = False
         for r in varlen_results:
-            gva_tag = "yes" if r["HV"] > r["H"] else "no"
+            is_gva = r["HV"] > r["H"]
+            if is_gva and not prev_gva:
+                print(f"  {'·' * 120}  ← GVA (HV > H)")
+            prev_gva = is_gva
+            gva_tag = "yes" if is_gva else "no"
             print(
                 f"  {r['tag']:>45s}  {r['H']:3d}  {r['HV']:3d}  {gva_tag:>4s}  │  "
                 f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
@@ -408,9 +433,9 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        default="all",
-        choices=["fixed", "varlen", "both", "all"],
-        help="Which benchmark mode to run (default: all). 'all'/'both' = fixed + varlen.",
+        default="both",
+        choices=["fixed", "varlen", "both"],
+        help="Which benchmark mode to run (default: both).",
     )
     parser.add_argument(
         "--ncu",
@@ -458,14 +483,13 @@ def main():
         (2, 4096),
         (2, 8192),
         (2, 16384),
-        # GVA (HV > H, same D=128):
-        (1, 1024, 16, 64),
-        (1, 4096, 16, 64),
-        (1, 8192, 16, 64),
-        (1, 4096, 32, 64),
-        (1, 8192, 32, 64),
-        (2, 4096, 16, 64),
-        (2, 8192, 16, 64),
+        # GVA (HV > H, same D=128): representative 2x and 4x ratios at key T values.
+        # Kept small intentionally — this script benchmarks the general KDA kernel;
+        # GVA configs are a supplementary check, not the primary focus.
+        (1, 4096, 32, 64),   # 2x ratio
+        (1, 8192, 32, 64),   # 2x ratio
+        (1, 4096, 16, 64),   # 4x ratio
+        (1, 8192, 16, 64),   # 4x ratio
     ]
 
     # Varlen configs: 3-tuples (seq_lens, total_len, dist) default to no GVA;
@@ -475,16 +499,21 @@ def main():
         total_lens=(4096, 8192, 16384),
         dists=("uniform", "random", "skewed"),
     )
-    # A small GVA subset reuses the non-GVA varlen shapes with (H_qk=16, HV=64).
-    gva_varlen = [(seq_lens, T, dist, 16, 64) for (seq_lens, T, dist) in varlen_configs_base if T <= 8192]
+    # GVA varlen: one representative config per total-length (random dist, 10 seqs,
+    # 4x ratio H=16→HV=64).  Kept minimal — supplementary GVA coverage only.
+    gva_varlen = [
+        (seq_lens, T, dist, 16, 64)
+        for (seq_lens, T, dist) in varlen_configs_base
+        if dist == "random" and len(seq_lens) == 10
+    ]
     varlen_configs = list(varlen_configs_base) + gva_varlen
 
     fixed_res, varlen_res = [], []
 
-    if args.mode in ("fixed", "both", "all"):
+    if args.mode in ("fixed", "both"):
         fixed_res = bench_fixed(fixed_configs)
 
-    if args.mode in ("varlen", "both", "all"):
+    if args.mode in ("varlen", "both"):
         varlen_res = bench_varlen(varlen_configs)
 
     print_report(fixed_res, varlen_res)

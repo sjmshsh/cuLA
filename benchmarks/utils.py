@@ -357,6 +357,65 @@ def prepare_safe_gate_inputs(
     )
 
 
+def prepare_gva_inputs(
+    batch_size,
+    T,
+    H,
+    HV,
+    D,
+    device,
+    cu_seqlens=None,
+    chunk_size=CHUNK_SIZE,
+    seed=SEED,
+    has_init_state=False,
+):
+    """Prepare inputs for GVA (Grouped Value Attention) benchmarks.
+
+    GVA uses separate head counts for QK (H) and V (HV), where HV > H and
+    HV is a positive multiple of H.  The grouping factor is G = HV // H.
+
+    Layout produced (after GVA expansion):
+        q, k, g, beta : HV heads  (q/k expanded from H via repeat_interleave)
+        v             : HV heads
+        A_log, dt_bias: sized to HV
+
+    This is a thin, named wrapper around ``prepare_safe_gate_inputs`` with
+    ``num_v_heads=HV``.  Having an explicit function makes the GVA data path
+    visible in benchmark scripts and easier to discover.
+
+    Args:
+        batch_size: Batch size ``B``.
+        T: Per-sequence token count.
+        H: Number of QK heads (group count).
+        HV: Number of V heads; must satisfy ``HV > H`` and ``HV % H == 0``.
+        D: Head dimension.
+        device: Target torch device.
+        cu_seqlens: Optional cumulative sequence-length tensor for varlen mode.
+        chunk_size: Chunk size passed to ``prepare_chunk_indices``.
+        seed: RNG seed for reproducibility.
+        has_init_state: If True, allocate a non-zero recurrent initial state.
+
+    Returns:
+        Same dict as ``prepare_safe_gate_inputs``.
+    """
+    if HV <= H:
+        raise ValueError(f"GVA requires HV > H, got H={H}, HV={HV}.")
+    if HV % H != 0:
+        raise ValueError(f"HV ({HV}) must be a positive multiple of H ({H}).")
+    return prepare_safe_gate_inputs(
+        batch_size=batch_size,
+        T=T,
+        H=H,
+        D=D,
+        device=device,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        seed=seed,
+        has_init_state=has_init_state,
+        num_v_heads=HV,
+    )
+
+
 def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED):
     """Prepare preprocessed inputs ready for chunk_kda_fwd_intra.
 
