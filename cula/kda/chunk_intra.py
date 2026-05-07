@@ -759,7 +759,22 @@ def chunk_kda_fwd_intra(
     unified_gref: bool = False,  # Set True for ~5% extra perf (slightly lower precision)
 ):
     assert safe_gate, "Only safe_gate=True is supported in chunk_kda_fwd_intra for now"
-    B, T, H, K = k.shape
+    # GVA support: Q/K have head-dim HQK; V/g/beta/Aqk/Akk/w/u/kg/qg have head-dim HV.
+    # Pre-GVA behaviour is preserved when HV == HQK.
+    B, T, HQK, K = k.shape
+    HV = v.shape[2]
+    assert v.shape[0] == B and v.shape[1] == T, (
+        f"v must share (B, T) with k; got k.shape={k.shape}, v.shape={v.shape}"
+    )
+    assert HV > 0 and HQK > 0 and HV % HQK == 0, (
+        f"v head-dim (HV={HV}) must be a positive multiple of k head-dim (HQK={HQK})"
+    )
+    if gk is not None:
+        assert gk.shape[0] == B and gk.shape[1] == T and gk.shape[2] == HV, (
+            f"gk shape must be (B, T, HV={HV}, K); got {tuple(gk.shape)}"
+        )
+    if beta is not None:
+        assert beta.shape[-1] == HV, f"beta last dim must equal HV={HV}; got {tuple(beta.shape)}"
     BT = chunk_size
 
     if cu_seqlens is None:
@@ -773,18 +788,20 @@ def chunk_kda_fwd_intra(
         "cu_seqlens and chunk_indices must be int32 for cuda impl"
     )
 
-    Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
-    Akk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
+    # Aqk/Akk are produced per v-head (they live in v-head space because g/beta are per v-head).
+    Aqk = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
+    Akk = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
 
     tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
     cula_cuda.chunk_kda_fwd_intra_cuda(
         q, k, gk, beta, cu_seqlens, chunk_indices, Aqk, Akk, tile_counter, scale, chunk_size, use_tf32_inverse, unified_gref
     )
 
-    w = torch.empty_like(k)
+    # w/u/kg/qg are all per-v-head outputs.
+    w = torch.empty(B, T, HV, K, device=k.device, dtype=k.dtype)
     u = torch.empty_like(v)
-    qg = torch.empty_like(q) if disable_recompute else None
-    kg = torch.empty_like(k) if gk is not None else None
+    qg = torch.empty(B, T, HV, K, device=q.device, dtype=q.dtype) if disable_recompute else None
+    kg = torch.empty(B, T, HV, K, device=k.device, dtype=k.dtype) if gk is not None else None
 
     cula_cuda.recompute_w_u_cuda(
         k, v, beta, Akk, gk, cu_seqlens, chunk_indices, w, u, kg, chunk_size, q if disable_recompute else None, qg
