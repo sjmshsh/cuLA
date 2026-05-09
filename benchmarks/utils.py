@@ -250,66 +250,6 @@ def build_varlen_configs(
     return configs
 
 
-def build_gva_fixed_configs(
-    batch_sizes=(1, 2),
-    seq_lens=(1024, 4096, 8192),
-    h_hv_pairs=((8, 32), (16, 64), (32, 64), (16, 128)),
-):
-    """Build (B, T, H, HV) fixed-length configs for dedicated GVA benchmarks.
-
-    All returned configs satisfy HV > H (GVA is always active).  The
-    ``h_hv_pairs`` argument lets callers control which (H, HV) / GVA-ratio
-    combinations are explored; the default covers 4x and 2x ratios used by
-    real KimiDeltaAttention deployments.
-
-    Returns:
-        list of (B: int, T: int, H: int, HV: int)
-    """
-    assert all(HV > H and HV % H == 0 for H, HV in h_hv_pairs), (
-        "Every (H, HV) pair must satisfy HV > H and HV % H == 0."
-    )
-    return [
-        (B, T, H, HV)
-        for B in batch_sizes
-        for T in seq_lens
-        for H, HV in h_hv_pairs
-    ]
-
-
-def build_gva_varlen_configs(
-    h_hv_pairs=((16, 64), (32, 64)),
-    num_seqs_list=(10, 20),
-    total_lens=(4096, 8192),
-    dists=("uniform", "random", "skewed"),
-    random_seed=42,
-):
-    """Build varlen GVA configs as 5-tuples (seq_lens, total_len, dist, H, HV).
-
-    Generates the non-GVA base configs via :func:`build_varlen_configs`, then
-    attaches each ``(H, HV)`` pair from *h_hv_pairs* to produce dedicated GVA
-    5-tuples ready for consumption by the varlen benchmark runner.
-
-    All (H, HV) pairs must satisfy HV > H and HV % H == 0.
-
-    Returns:
-        list of (seq_lens: list[int], total_len: int, dist: str, H: int, HV: int)
-    """
-    assert all(HV > H and HV % H == 0 for H, HV in h_hv_pairs), (
-        "Every (H, HV) pair must satisfy HV > H and HV % H == 0."
-    )
-    base = build_varlen_configs(
-        num_seqs_list=num_seqs_list,
-        total_lens=total_lens,
-        dists=dists,
-        random_seed=random_seed,
-    )
-    return [
-        (seq_lens, T, dist, H, HV)
-        for H, HV in h_hv_pairs
-        for seq_lens, T, dist in base
-    ]
-
-
 # ==============================================================================
 # Common input preparation functions for benchmarks and demos
 # ==============================================================================
@@ -350,7 +290,7 @@ def prepare_safe_gate_inputs(
                 `kda_gate_chunk_cumsum` indexes them per head of `g`.
             This expanded layout works on both cuLA backends (SM100 requires
             q.shape[-2] == v.shape[-2]; SM90 accepts both native and expanded
-            GVA) and on FLA's `chunk_kda` (which does not natively support GVA).
+            GVA) and on FLA's `chunk_kda`.
 
     All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
     The returned dict always contains `H` and `HV` keys so callers can report
@@ -414,71 +354,6 @@ def prepare_safe_gate_inputs(
         lower_bound=-5.0,
         H=H,
         HV=HV,
-    )
-
-
-def prepare_gva_inputs(
-    batch_size, T, H, HV, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED, has_init_state=False
-):
-    """Prepare inputs for GVA (Grouped Value Attention) benchmarks.
-
-    In GVA, num_v_heads (HV) > num_heads (H), with HV divisible by H.
-    q/k/g/beta are generated with H heads then repeated gva_ratio = HV // H times
-    to match v's HV heads, mirroring what KimiDeltaAttention does at the layer level.
-
-    All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
-    """
-    assert HV % H == 0, f"HV={HV} must be divisible by H={H}"
-    gva_ratio = HV // H
-    dtype = torch.bfloat16
-    scale = D ** (-0.5)
-
-    set_seed(seed)
-
-    # Base tensors with H heads (as produced before the repeat in the layer)
-    q_base = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    k_base = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    v      = torch.randn(batch_size, T, HV, D, dtype=dtype, device=device).requires_grad_(False)
-    g_base = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    beta_base = torch.randn(batch_size, T, H, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
-
-    A_log   = torch.randn(HV, dtype=torch.float, device=device).requires_grad_(False)
-    dt_bias = torch.randn(HV * D, dtype=torch.float, device=device).requires_grad_(False)
-
-    # Expand q, k, g, beta to HV heads (same as the layer's repeat)
-    from einops import repeat as einops_repeat
-    q    = einops_repeat(q_base,    "b t h d -> b t (h r) d", r=gva_ratio).contiguous()
-    k    = einops_repeat(k_base,    "b t h d -> b t (h r) d", r=gva_ratio).contiguous()
-    g    = einops_repeat(g_base,    "b t h d -> b t (h r) d", r=gva_ratio).contiguous()
-    beta = einops_repeat(beta_base, "b t h   -> b t (h r)",   r=gva_ratio).contiguous()
-
-    # Flatten to batch_size=1 for cu_seqlens compatibility
-    if batch_size != 1:
-        q, k, v, g, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g, beta))
-
-    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
-
-    init_state = None
-    if has_init_state:
-        num_seqs = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else batch_size
-        init_state = torch.randn(num_seqs, HV, D, D, dtype=torch.float, device=device).requires_grad_(False)
-
-    return dict(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        init_state=init_state,
-        lower_bound=-5.0,
-        H=H,
-        HV=HV,
-        gva_ratio=gva_ratio,
     )
 
 

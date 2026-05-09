@@ -24,13 +24,13 @@ using namespace cute;
 
 struct WorkDesc {
     // coord
-    int32_t seq_idx;       // which sequence to process
-    int32_t qk_head_idx;   // head idx for Q/K (the representative of the GVA group)
-    int32_t head_idx;      // head idx for V/O/g/beta
-    int64_t tok_offset;    // start offset of this sequence in the packed tensor
+    int32_t seq_idx;      // which sequence to process
+    int32_t qk_head_idx;  // head idx for Q/K (the representative of the GVA group)
+    int32_t head_idx;     // head idx for V/O/g/beta
+    int64_t tok_offset;   // start offset of this sequence in the packed tensor
 
     // shape
-    int64_t seq_len;       // length of this sequence
+    int64_t seq_len;  // length of this sequence
 
     // update by mainloop
     int32_t tile_idx = 0;  // current tile index (mutated by the mainloop)

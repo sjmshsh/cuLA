@@ -25,31 +25,20 @@ Compares:
   - Accuracy: RMSE, relative max diff between cuLA fully-fused and FLA Triton
   - Performance: kernel execution time (ms) with CUDA events
 
-Modes (--mode, default: all):
-  - fixed:    Fixed-length sequences, various (B, T, H, HV) configs.
-              GVA rows (HV > H) are mixed in alongside non-GVA rows.
-  - varlen:   Variable-length sequences with 2-3x length variation.
-              Non-GVA base configs plus a GVA subset (H=16, HV=64).
-  - gva:      Dedicated GVA benchmark (fixed + varlen) using prepare_gva_inputs.
-              Covers multiple GVA ratios (2x / 4x / 8x); compares cuLA vs FLA.
-  - overhead: GVA overhead benchmark — cuLA GVA vs cuLA non-GVA at the same
-              total head count (HV).  Both paths present identical tensor shapes
-              to the kernel, so a near-zero overhead% proves that GVA adds no
-              measurable kernel latency regression.
-  - both:     Fixed-length + varlen only (legacy alias, no gva/overhead).
-  - all:      Run all of the above.
-
-Under GVA (HV > H), q/k are expanded from H to HV heads via
-`repeat_interleave(..., dim=2)`, equivalent to the einops pattern
-`repeat(x, "... h d -> ... (h g) d")`.  This keeps FLA's `chunk_kda`
-(which does not natively support GVA) and cuLA's SM100 fully-fused forward
-(which requires q/k/v to share the head dim) on the same input layout.
+Modes (--mode, default: both):
+  - fixed:  Fixed-length sequences, various (B, T, H, HV) configs.
+            When HV > H the row is a GVA (Grouped Value Attention) workload;
+            GVA and MHA rows share the same sequence-length settings so they
+            can be compared side by side in a single table.
+  - varlen: Variable-length sequences with 2-3x length variation, same mixing
+            of GVA (HV > H) and MHA (HV == H) rows.
+  - both:   Run fixed + varlen (default).
 
 Usage:
-  python bench_kda_fused_fwd.py [--mode fixed|varlen|gva|overhead|both|all] [--ncu]
+  python bench_kda_fused_fwd.py [--mode fixed|varlen|both] [--ncu]
 
 With --ncu, warmup=1 and iters=1 for ncu profiling:
-  ncu --set full -o report python bench_kda_fused_fwd.py --mode overhead --ncu
+  ncu --set full -o report python bench_kda_fused_fwd.py --mode varlen --ncu
 """
 
 import argparse
@@ -65,11 +54,8 @@ from fla.ops.kda import chunk_kda as fla_chunk_kda
 
 from benchmarks.utils import (
     SEED,
-    build_gva_fixed_configs,
-    build_gva_varlen_configs,
     build_varlen_configs,
     exclusive_cumsum,
-    prepare_gva_inputs,
     prepare_safe_gate_inputs,
     set_seed,
 )
@@ -87,7 +73,8 @@ cula_kda_fused_fwd = get_kda_fused_fwd(_device)
 # Constants
 # ============================================================
 # Default number of Q/K heads. Each benchmark config may additionally specify
-# HV (number of V heads) to enable GVA (HV > H must be a positive multiple of H).
+# HV (number of V heads); when HV > H the row runs in GVA mode (the kernel
+# sees HV expanded q/k heads, prepared internally by prepare_safe_gate_inputs).
 H, D = 64, 128
 WARMUP = 25
 N_ITERS = 100
@@ -197,9 +184,12 @@ def _normalize_varlen_config(cfg):
         return seq_lens, total_len, dist, H, H
     if len(cfg) == 5:
         return cfg
-    raise ValueError(
-        f"Varlen config must be (seq_lens, total_len, dist) or (seq_lens, total_len, dist, H, HV), got {cfg!r}"
-    )
+    raise ValueError(f"Varlen config must be (seq_lens, total_len, dist) or (seq_lens, total_len, dist, H, HV), got {cfg!r}")
+
+
+def _gva_hint(H_qk, HV):
+    """Return a short tag marking GVA vs MHA rows for progress prints."""
+    return f"[GVA {HV // H_qk}x]" if HV > H_qk else "[MHA]"
 
 
 # ============================================================
@@ -213,6 +203,7 @@ def bench_fixed(configs):
 
     for cfg in configs:
         B, T, H_qk, HV = _normalize_fixed_config(cfg)
+        print(f"  {_gva_hint(H_qk, HV):>9s}  B={B} T={T} H={H_qk} HV={HV}")
         set_seed(SEED)
         device = torch.device("cuda")
         torch.cuda.empty_cache()
@@ -221,7 +212,11 @@ def bench_fixed(configs):
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
         inputs = prepare_safe_gate_inputs(
-            B, T, H_qk, D, device,
+            B,
+            T,
+            H_qk,
+            D,
+            device,
             cu_seqlens=cu_seqlens,
             has_init_state=HAS_INIT_STATE,
             num_v_heads=HV,
@@ -288,6 +283,7 @@ def bench_varlen(configs):
 
     for cfg in configs:
         seq_lens, total_len, dist, H_qk, HV = _normalize_varlen_config(cfg)
+        print(f"  {_gva_hint(H_qk, HV):>9s}  {dist} {len(seq_lens)}seqs T={total_len} H={H_qk} HV={HV}")
         set_seed(SEED)
         device = torch.device("cuda")
         torch.cuda.empty_cache()
@@ -296,7 +292,11 @@ def bench_varlen(configs):
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
         inputs = prepare_safe_gate_inputs(
-            1, T, H_qk, D, device,
+            1,
+            T,
+            H_qk,
+            D,
+            device,
             cu_seqlens=cu_seqlens,
             has_init_state=HAS_INIT_STATE,
             num_v_heads=HV,
@@ -354,268 +354,6 @@ def bench_varlen(configs):
         )
 
         del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
-        torch.cuda.empty_cache()
-
-    return results
-
-
-# ============================================================
-# GVA-dedicated benchmarks (uses prepare_gva_inputs)
-# ============================================================
-def bench_gva_fixed(configs):
-    """Fixed-length GVA benchmark using :func:`prepare_gva_inputs`.
-
-    All configs must have HV > H.  Data is prepared the same way as in the
-    KimiDeltaAttention layer: q/k/g/beta are first generated with H heads and
-    then expanded to HV heads via einops repeat before being fed to both cuLA
-    and FLA.
-    """
-    print("\n" + "=" * 100)
-    print(f" GVA Fixed-Length Benchmark: cuLA fully-fused ({_SM_TAG}) vs FLA Triton")
-    print("=" * 100)
-    results = []
-
-    for B, T, H_qk, HV in configs:
-        assert HV > H_qk, f"GVA requires HV > H, got H={H_qk} HV={HV}"
-        set_seed(SEED)
-        device = torch.device("cuda")
-        torch.cuda.empty_cache()
-
-        seq_lens = [T] * B
-        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
-
-        inputs = prepare_gva_inputs(
-            B, T, H_qk, HV, D, device,
-            cu_seqlens=cu_seqlens,
-            has_init_state=HAS_INIT_STATE,
-        )
-        q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
-        A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
-        scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
-        gva_ratio = inputs["gva_ratio"]
-
-        common = dict(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            init_state=init_state,
-            cu_seqlens=cu_seqlens,
-            lower_bound=lower_bound,
-        )
-
-        # Accuracy
-        o_fla, _ = run_fla(**common)
-        o_cula, _ = run_cula(**common)
-        torch.cuda.synchronize()
-
-        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
-
-        # Performance
-        ms_fla = time_kernel(lambda: run_fla(**common))
-        ms_cula = time_kernel(lambda: run_cula(**common))
-        speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
-
-        results.append(
-            {
-                "B": B,
-                "T": T,
-                "H": H_qk,
-                "HV": HV,
-                "gva_ratio": gva_ratio,
-                "rmse": rmse,
-                "rel_max": rel_max,
-                "mean_diff": mean_diff,
-                "ms_fla": ms_fla,
-                "ms_cula": ms_cula,
-                "speedup": speedup,
-            }
-        )
-
-        del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
-        torch.cuda.empty_cache()
-
-    return results
-
-
-def bench_gva_varlen(configs):
-    """Varlen GVA benchmark using :func:`prepare_gva_inputs`.
-
-    Configs are 5-tuples (seq_lens, total_len, dist, H, HV) as produced by
-    :func:`~benchmarks.utils.build_gva_varlen_configs`.
-    All configs must have HV > H.
-    """
-    print("\n" + "=" * 100)
-    print(f" GVA Varlen Benchmark: cuLA fully-fused ({_SM_TAG}) vs FLA Triton")
-    print("=" * 100)
-    results = []
-
-    for seq_lens, total_len, dist, H_qk, HV in configs:
-        assert HV > H_qk, f"GVA requires HV > H, got H={H_qk} HV={HV}"
-        set_seed(SEED)
-        device = torch.device("cuda")
-        torch.cuda.empty_cache()
-
-        T = total_len
-        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
-
-        inputs = prepare_gva_inputs(
-            1, T, H_qk, HV, D, device,
-            cu_seqlens=cu_seqlens,
-            has_init_state=HAS_INIT_STATE,
-        )
-        q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
-        A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
-        scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
-        gva_ratio = inputs["gva_ratio"]
-
-        common = dict(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            init_state=init_state,
-            cu_seqlens=cu_seqlens,
-            lower_bound=lower_bound,
-        )
-
-        # Accuracy
-        o_fla, _ = run_fla(**common)
-        o_cula, _ = run_cula(**common)
-        torch.cuda.synchronize()
-
-        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
-
-        # Performance
-        ms_fla = time_kernel(lambda: run_fla(**common))
-        ms_cula = time_kernel(lambda: run_cula(**common))
-        speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
-
-        n_seqs = len(seq_lens)
-        min_l, max_l = min(seq_lens), max(seq_lens)
-        avg_l = T // n_seqs
-        tag = f"{dist:>7s} {n_seqs:>2d}seqs T={T} [{min_l}..{max_l}] avg={avg_l}"
-
-        results.append(
-            {
-                "tag": tag,
-                "dist": dist,
-                "T_total": T,
-                "n_seqs": n_seqs,
-                "H": H_qk,
-                "HV": HV,
-                "gva_ratio": gva_ratio,
-                "rmse": rmse,
-                "rel_max": rel_max,
-                "mean_diff": mean_diff,
-                "ms_fla": ms_fla,
-                "ms_cula": ms_cula,
-                "speedup": speedup,
-            }
-        )
-
-        del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
-        torch.cuda.empty_cache()
-
-    return results
-
-
-# ============================================================
-# GVA overhead benchmark
-# (proves GVA adds no kernel cost vs a plain non-GVA run)
-# ============================================================
-def bench_gva_overhead(configs):
-    """Quantify the kernel overhead introduced by GVA vs a plain non-GVA run.
-
-    For every ``(B, T, H_qk, HV)`` config this function runs **cuLA only**
-    with two different input preparations — both produce tensors of identical
-    shape ``(1, B*T, HV, D)`` entering the kernel:
-
-    * **baseline** – standard non-GVA: H = HV unique q/k heads, prepared via
-      :func:`prepare_safe_gate_inputs` with ``num_v_heads=HV``.
-    * **GVA**      – grouped q/k: H < HV heads expanded to HV via
-      ``repeat_interleave``, prepared via :func:`prepare_gva_inputs`.
-
-    Because the kernel receives identically-shaped tensors in both cases, the
-    extra work that GVA adds is *only* the ``repeat_interleave`` call done in
-    Python before the kernel is launched.  A near-zero ``overhead%`` column in
-    the report confirms that the GVA feature introduces no measurable kernel
-    latency regression.
-
-    Note: FLA is intentionally excluded; the comparison is purely cuLA vs cuLA.
-    """
-    print("\n" + "=" * 100)
-    print(f" GVA Overhead Benchmark: cuLA GVA vs cuLA non-GVA  (same kernel shape, {_SM_TAG})")
-    print("=" * 100)
-    results = []
-
-    for cfg in configs:
-        B, T, H_qk, HV = _normalize_fixed_config(cfg)
-        assert HV > H_qk, f"GVA overhead bench requires HV > H, got H={H_qk} HV={HV}"
-        gva_ratio = HV // H_qk
-        set_seed(SEED)
-        device = torch.device("cuda")
-        torch.cuda.empty_cache()
-
-        seq_lens = [T] * B
-        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
-
-        # ── baseline: non-GVA with HV heads (H == HV) ────────────────────────
-        inp_base = prepare_safe_gate_inputs(
-            B, T, HV, D, device,
-            cu_seqlens=cu_seqlens,
-            has_init_state=HAS_INIT_STATE,
-            num_v_heads=HV,
-        )
-        common_base = dict(
-            q=inp_base["q"], k=inp_base["k"], v=inp_base["v"],
-            g=inp_base["g"], beta=inp_base["beta"],
-            scale=inp_base["scale"], A_log=inp_base["A_log"],
-            dt_bias=inp_base["dt_bias"], init_state=inp_base["init_state"],
-            cu_seqlens=cu_seqlens, lower_bound=inp_base["lower_bound"],
-        )
-
-        # ── GVA: H_qk heads expanded to HV ───────────────────────────────────
-        inp_gva = prepare_gva_inputs(
-            B, T, H_qk, HV, D, device,
-            cu_seqlens=cu_seqlens,
-            has_init_state=HAS_INIT_STATE,
-        )
-        common_gva = dict(
-            q=inp_gva["q"], k=inp_gva["k"], v=inp_gva["v"],
-            g=inp_gva["g"], beta=inp_gva["beta"],
-            scale=inp_gva["scale"], A_log=inp_gva["A_log"],
-            dt_bias=inp_gva["dt_bias"], init_state=inp_gva["init_state"],
-            cu_seqlens=cu_seqlens, lower_bound=inp_gva["lower_bound"],
-        )
-
-        # ── performance ───────────────────────────────────────────────────────
-        ms_base = time_kernel(lambda: run_cula(**common_base))
-        ms_gva  = time_kernel(lambda: run_cula(**common_gva))
-        overhead_pct = (ms_gva - ms_base) / ms_base * 100.0 if ms_base > 0 else 0.0
-
-        results.append(
-            {
-                "B": B,
-                "T": T,
-                "H": H_qk,
-                "HV": HV,
-                "gva_ratio": gva_ratio,
-                "ms_base": ms_base,
-                "ms_gva": ms_gva,
-                "overhead_pct": overhead_pct,
-            }
-        )
-
-        del inp_base, inp_gva
         torch.cuda.empty_cache()
 
     return results
@@ -624,13 +362,13 @@ def bench_gva_overhead(configs):
 # ============================================================
 # Report
 # ============================================================
-def print_report(fixed_results, varlen_results, gva_fixed_results=None, gva_varlen_results=None, overhead_results=None):
+def print_report(fixed_results, varlen_results):
     sep = "=" * 120
     print(f"\n\n{sep}")
     print("                  BENCHMARK REPORT: cula_kda_fused_fwd (fully-fused)")
     print(f"                  cuLA {_SM_TAG} fully-fused vs FLA Triton")
     print(f"                  D={D}  dtype=bf16  safe_gate=True  has_init_state={HAS_INIT_STATE}")
-    print(f"                  GVA rows are those with HV > H (H, HV shown per row).")
+    print("                  GVA rows are those with HV > H (H, HV shown per row).")
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
     mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
@@ -647,7 +385,7 @@ def print_report(fixed_results, varlen_results, gva_fixed_results=None, gva_varl
         )
         print(f"  {'─' * 110}")
         for r in fixed_results:
-            gva_tag = "yes" if r["HV"] > r["H"] else "no"
+            gva_tag = f"{r['HV'] // r['H']}x" if r["HV"] > r["H"] else "no"
             print(
                 f"  {r['B']:3d}  {r['T']:6d}  {r['H']:3d}  {r['HV']:3d}  {gva_tag:>4s}  │  "
                 f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
@@ -665,64 +403,13 @@ def print_report(fixed_results, varlen_results, gva_fixed_results=None, gva_varl
         )
         print(f"  {'─' * 120}")
         for r in varlen_results:
-            gva_tag = "yes" if r["HV"] > r["H"] else "no"
+            gva_tag = f"{r['HV'] // r['H']}x" if r["HV"] > r["H"] else "no"
             print(
                 f"  {r['tag']:>45s}  {r['H']:3d}  {r['HV']:3d}  {gva_tag:>4s}  │  "
                 f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x"
             )
         print(f"  {'─' * 120}")
-
-    if gva_fixed_results:
-        print("\n  [GVA Fixed-Length]  (data prepared via prepare_gva_inputs)")
-        print(f"  {'─' * 116}")
-        print(
-            f"  {'B':>3s}  {'T':>6s}  {'H':>3s}  {'HV':>3s}  {'ratio':>5s}  │  "
-            f"{'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}  │  "
-            f"{'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
-        )
-        print(f"  {'─' * 116}")
-        for r in gva_fixed_results:
-            print(
-                f"  {r['B']:3d}  {r['T']:6d}  {r['H']:3d}  {r['HV']:3d}  {r['gva_ratio']:4d}x  │  "
-                f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
-                f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x"
-            )
-        print(f"  {'─' * 116}")
-
-    if gva_varlen_results:
-        print("\n  [GVA Varlen]  (data prepared via prepare_gva_inputs)")
-        print(f"  {'─' * 126}")
-        print(
-            f"  {'Config':>45s}  {'H':>3s}  {'HV':>3s}  {'ratio':>5s}  │  "
-            f"{'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}  │  "
-            f"{'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
-        )
-        print(f"  {'─' * 126}")
-        for r in gva_varlen_results:
-            print(
-                f"  {r['tag']:>45s}  {r['H']:3d}  {r['HV']:3d}  {r['gva_ratio']:4d}x  │  "
-                f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
-                f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x"
-            )
-        print(f"  {'─' * 126}")
-
-    if overhead_results:
-        print("\n  [GVA Overhead]  cuLA GVA vs cuLA non-GVA — same kernel shape, same HV heads")
-        print("  (near-zero overhead% proves GVA adds no kernel latency)")
-        print(f"  {'─' * 96}")
-        print(
-            f"  {'B':>3s}  {'T':>6s}  {'H':>3s}  {'HV':>3s}  {'ratio':>5s}  │  "
-            f"{'base(ms)':>10s}  {'gva(ms)':>10s}  {'overhead%':>10s}"
-        )
-        print(f"  {'─' * 96}")
-        for r in overhead_results:
-            flag = "  ✓" if abs(r["overhead_pct"]) < 3.0 else "  !"
-            print(
-                f"  {r['B']:3d}  {r['T']:6d}  {r['H']:3d}  {r['HV']:3d}  {r['gva_ratio']:4d}x  │  "
-                f"{r['ms_base']:10.4f}  {r['ms_gva']:10.4f}  {r['overhead_pct']:+9.2f}%{flag}"
-            )
-        print(f"  {'─' * 96}")
 
     print(f"\n{sep}\n")
 
@@ -735,16 +422,13 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        default="all",
-        choices=["fixed", "varlen", "gva", "overhead", "both", "all"],
+        default="both",
+        choices=["fixed", "varlen", "both"],
         help=(
-            "Which benchmark mode to run (default: all). "
-            "'all' = fixed + varlen + gva + overhead.  "
-            "'both' = fixed + varlen only (legacy alias).  "
-            "'gva' runs the dedicated GVA benchmark (fixed + varlen, "
-            "data prepared via prepare_gva_inputs with multiple GVA ratios).  "
-            "'overhead' compares cuLA-GVA vs cuLA-non-GVA at the same total "
-            "head count to prove GVA adds no kernel latency regression."
+            "Which benchmark mode to run (default: both). "
+            "GVA rows (HV > H) are mixed in alongside MHA rows (HV == H) "
+            "under the same sequence-length settings, so GVA and MHA can be "
+            "compared side by side."
         ),
     )
     parser.add_argument(
@@ -780,94 +464,56 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # Fixed-length configs: (B, T) → H_qk=HV=H (no GVA); (B, T, H_qk, HV)
-    # activates GVA when HV > H. The two forms can be freely mixed.
+    # Fixed-length configs — MHA and GVA rows share the same (B, T) grid.
+    #   (B, T)                 → MHA  (H_qk = HV = default H)
+    #   (B, T, H_qk, HV)       → GVA when HV > H_qk (HV must be a multiple of H_qk)
     # ------------------------------------------------------------------
     fixed_configs = [
-        # Non-GVA (H_qk == HV == H):
-        (1, 512),
+        # MHA (HV == H):
         (1, 1024),
         (1, 4096),
         (1, 8192),
         (1, 16384),
-        (2, 512),
-        (2, 1024),
         (2, 4096),
         (2, 8192),
-        (2, 16384),
-        # GVA (HV > H, same D=128):
-        (1, 1024, 16, 64),
-        (1, 4096, 16, 64),
-        (1, 8192, 16, 64),
-        (1, 4096, 32, 64),
-        (1, 8192, 32, 64),
-        (2, 4096, 16, 64),
-        (2, 8192, 16, 64),
+        # GVA (HV > H) at the same (B, T) shapes for side-by-side comparison:
+        (1, 1024, 16, 64),   # 4x
+        (1, 4096, 16, 64),   # 4x
+        (1, 8192, 16, 64),   # 4x
+        (1, 16384, 16, 64),  # 4x
+        (1, 4096, 32, 64),   # 2x
+        (1, 8192, 32, 64),   # 2x
+        (1, 4096, 8, 64),    # 8x
+        (1, 8192, 8, 64),    # 8x
+        (2, 4096, 16, 64),   # 4x
+        (2, 8192, 16, 64),   # 4x
     ]
 
-    # Varlen configs: 3-tuples (seq_lens, total_len, dist) default to no GVA;
-    # extend to 5-tuples (..., H_qk, HV) to activate GVA on varlen workloads.
+    # Varlen configs — identical sequence-length layouts replayed with and
+    # without GVA so MHA and GVA can be compared row-by-row.
     varlen_configs_base = build_varlen_configs(
-        num_seqs_list=(10, 20),
-        total_lens=(4096, 8192, 16384),
-        dists=("uniform", "random", "skewed"),
-    )
-    # A small GVA subset reuses the non-GVA varlen shapes with (H_qk=16, HV=64).
-    gva_varlen_mixed = [(seq_lens, T, dist, 16, 64) for (seq_lens, T, dist) in varlen_configs_base if T <= 8192]
-    varlen_configs = list(varlen_configs_base) + gva_varlen_mixed
-
-    # ------------------------------------------------------------------
-    # Dedicated GVA configs (multiple GVA ratios, uses prepare_gva_inputs)
-    # ------------------------------------------------------------------
-    gva_fixed_configs = build_gva_fixed_configs(
-        batch_sizes=(1, 2),
-        seq_lens=(1024, 4096, 8192),
-        h_hv_pairs=((8, 32), (16, 64), (32, 64), (16, 128)),
-    )
-    gva_varlen_configs = build_gva_varlen_configs(
-        h_hv_pairs=((16, 64), (32, 64)),
         num_seqs_list=(10, 20),
         total_lens=(4096, 8192),
         dists=("uniform", "random", "skewed"),
     )
-
-    # Overhead configs: (B, T, H_qk, HV) — HV > H required.
-    # For each row the benchmark runs cuLA twice:
-    #   baseline → non-GVA with HV heads (H == HV)
-    #   gva      → GVA with H_qk heads expanded to HV
-    # Both kernel inputs have shape (1, B*T, HV, D), so overhead% ≈ 0 proves
-    # that GVA adds no kernel latency regression.
-    overhead_configs = [
-        (1, 1024,  16,  64),   # 4x GVA ratio
-        (1, 4096,  16,  64),
-        (1, 8192,  16,  64),
-        (1, 16384, 16,  64),
-        (1, 4096,  32,  64),   # 2x GVA ratio
-        (1, 8192,  32,  64),
-        (1, 4096,   8,  64),   # 8x GVA ratio
-        (1, 8192,   8,  64),
-        (2, 4096,  16,  64),
-        (2, 8192,  16,  64),
+    gva_varlen_mixed = [
+        (seq_lens, T, dist, H_qk, HV)
+        for (H_qk, HV) in ((16, 64), (32, 64))
+        for (seq_lens, T, dist) in varlen_configs_base
     ]
+    varlen_configs = list(varlen_configs_base) + gva_varlen_mixed
 
-    fixed_res, varlen_res, gva_fixed_res, gva_varlen_res, overhead_res = [], [], [], [], []
+    fixed_res, varlen_res = [], []
 
-    if args.mode in ("fixed", "both", "all"):
+    if args.mode in ("fixed", "both"):
         fixed_res = bench_fixed(fixed_configs)
 
-    if args.mode in ("varlen", "both", "all"):
+    if args.mode in ("varlen", "both"):
         varlen_res = bench_varlen(varlen_configs)
 
-    if args.mode in ("gva", "all"):
-        gva_fixed_res = bench_gva_fixed(gva_fixed_configs)
-        gva_varlen_res = bench_gva_varlen(gva_varlen_configs)
+    print_report(fixed_res, varlen_res)
 
-    if args.mode in ("overhead", "all"):
-        overhead_res = bench_gva_overhead(overhead_configs)
-
-    print_report(fixed_res, varlen_res, gva_fixed_res, gva_varlen_res, overhead_res)
-
-    return fixed_res, varlen_res, gva_fixed_res, gva_varlen_res, overhead_res
+    return fixed_res, varlen_res
 
 
 if __name__ == "__main__":

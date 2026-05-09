@@ -117,8 +117,7 @@ kda_fwd_prefill(
             beta.dtype());
         TORCH_CHECK(beta.is_contiguous(), "beta must be contiguous");
         TORCH_CHECK(
-            beta.size(0) == packed_seq && beta.size(1) == num_v_heads,
-            "beta shape must be [packed_seq, num_v_heads]");
+            beta.size(0) == packed_seq && beta.size(1) == num_v_heads, "beta shape must be [packed_seq, num_v_heads]");
     }
     if (input_state_.has_value()) {
         auto& input_state = input_state_.value();

@@ -24,6 +24,7 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 import cula.cudac as cula_cuda
 from cula.utils import _get_cache_buf, assert_hopper, get_device_sm_count, prepare_uniform_cu_seqlens
 
+
 class HopperChunkKDAFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
@@ -51,9 +52,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         # GVA: q/k share num_qk_heads; v/g/beta share num_v_heads.
         # num_v_heads must be a positive multiple of num_qk_heads (heads_per_group = HV / H).
         assert q.shape == k.shape, "q and k must have the same shape."
-        assert q.shape[:2] == v.shape[:2] == g.shape[:2], (
-            "q, k, v, g must share batch and sequence dimensions."
-        )
+        assert q.shape[:2] == v.shape[:2] == g.shape[:2], "q, k, v, g must share batch and sequence dimensions."
 
         batch_size, seq_len, num_qk_heads, head_dim = q.shape
         num_v_heads = v.shape[-2]
@@ -230,9 +229,7 @@ def cula_kda_prefill(
                 raise ValueError(f"`lower_bound` must be in the safe range [-5, 0), got {lower_bound}.")
 
     assert q.shape == k.shape, "q and k must have the same shape."
-    assert q.shape[:2] == v.shape[:2] == g.shape[:2], (
-        "q, k, v, g must share batch and sequence dimensions."
-    )
+    assert q.shape[:2] == v.shape[:2] == g.shape[:2], "q, k, v, g must share batch and sequence dimensions."
 
     batch_size, seq_len, num_qk_heads, head_dim = q.shape
     num_v_heads = v.shape[-2]
