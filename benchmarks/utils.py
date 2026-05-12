@@ -265,11 +265,14 @@ def prepare_safe_gate_inputs(
     chunk_size=CHUNK_SIZE,
     seed=SEED,
     has_init_state=False,
+    num_v_heads=None,
 ):
     """Prepare inputs for safe_gate benchmarks (use_gate_in_kernel=True, safe_gate=True).
 
     All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
     """
+    HV = H if num_v_heads is None else num_v_heads
+    assert HV >= H and HV % H == 0, f"HV ({HV}) must be a positive multiple of H ({H}) with HV >= H."
 
     dtype = torch.bfloat16
     scale = D ** (-0.5)
