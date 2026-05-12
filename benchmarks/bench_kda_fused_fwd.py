@@ -159,11 +159,11 @@ def run_cula(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, lo
 
 
 # ============================================================
-# Fixed-length benchmark (GVA when global HV > H)
+# Fixed-length benchmark
 # ============================================================
 def bench_fixed(configs):
     print("\n" + "=" * 100)
-    print(f" Fixed-Length Benchmark: cuLA fully-fused ({_SM_TAG}) vs FLA Triton  (GVA when HV > H)")
+    print(f" Fixed-Length Benchmark: cuLA fully-fused ({_SM_TAG}) vs FLA Triton")
     print("=" * 100)
     results = []
 
@@ -238,11 +238,11 @@ def bench_fixed(configs):
 
 
 # ============================================================
-# Varlen benchmark (GVA when global HV > H)
+# Varlen benchmark
 # ============================================================
 def bench_varlen(configs):
     print("\n" + "=" * 100)
-    print(f" Varlen Benchmark: cuLA fully-fused ({_SM_TAG}) vs FLA Triton  (GVA when HV > H)")
+    print(f" Varlen Benchmark: cuLA fully-fused ({_SM_TAG}) vs FLA Triton")
     print("=" * 100)
     results = []
 
