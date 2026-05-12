@@ -26,16 +26,16 @@ Compares:
   - Performance: kernel execution time (ms) with CUDA events
 
 Modes (--mode, default: both):
-  - fixed:  Fixed-length sequences, various (B, T, H, HV) configs.
-            When HV > H the row is a GVA (Grouped Value Attention) workload;
-            GVA and MHA rows share the same sequence-length settings so they
-            can be compared side by side in a single table.
-  - varlen: Variable-length sequences with 2-3x length variation, same mixing
-            of GVA (HV > H) and MHA (HV == H) rows.
+  - fixed:  Fixed-length (B, T) sequences.
+  - varlen: Variable-length sequences with 2-3x length variation.
   - both:   Run fixed + varlen (default).
 
+H (number of Q/K heads) is a module-level constant; HV (number of V heads)
+defaults to H and can be overridden globally via --hv to run every config in
+GVA (Grouped Value Attention) mode. HV must be a positive multiple of H.
+
 Usage:
-  python bench_kda_fused_fwd.py [--mode fixed|varlen|both] [--ncu]
+  python bench_kda_fused_fwd.py [--mode fixed|varlen|both] [--hv HV] [--ncu]
 
 With --ncu, warmup=1 and iters=1 for ncu profiling:
   ncu --set full -o report python bench_kda_fused_fwd.py --mode varlen --ncu
@@ -72,10 +72,11 @@ cula_kda_fused_fwd = get_kda_fused_fwd(_device)
 # ============================================================
 # Constants
 # ============================================================
-# Default number of Q/K heads. Each benchmark config may additionally specify
-# HV (number of V heads); when HV > H the row runs in GVA mode (the kernel
-# sees HV expanded q/k heads, prepared internally by prepare_safe_gate_inputs).
+# Default number of Q/K heads (H) and V heads (HV). When HV > H the run is in
+# GVA mode (the kernel sees HV expanded q/k heads, prepared internally by
+# prepare_safe_gate_inputs). HV is overridable globally via --hv.
 H, D = 64, 128
+HV = H
 WARMUP = 25
 N_ITERS = 100
 NCU_MODE = False
@@ -159,41 +160,15 @@ def run_cula(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, lo
 
 
 # ============================================================
-# Config normalization helpers
+# GVA hint
 # ============================================================
-def _normalize_fixed_config(cfg):
-    """Accept either (B, T) or (B, T, H_qk, HV) and return the 4-tuple form.
-
-    For the 2-tuple legacy form, defaults to H_qk=HV=H (no GVA).
-    """
-    if len(cfg) == 2:
-        B, T = cfg
-        return B, T, H, H
-    if len(cfg) == 4:
-        return cfg
-    raise ValueError(f"Fixed config must be (B, T) or (B, T, H, HV), got {cfg!r}")
-
-
-def _normalize_varlen_config(cfg):
-    """Accept (seq_lens, total_len, dist) or (seq_lens, total_len, dist, H_qk, HV).
-
-    For the 3-tuple legacy form, defaults to H_qk=HV=H (no GVA).
-    """
-    if len(cfg) == 3:
-        seq_lens, total_len, dist = cfg
-        return seq_lens, total_len, dist, H, H
-    if len(cfg) == 5:
-        return cfg
-    raise ValueError(f"Varlen config must be (seq_lens, total_len, dist) or (seq_lens, total_len, dist, H, HV), got {cfg!r}")
-
-
-def _gva_hint(H_qk, HV):
-    """Return a short tag marking GVA vs MHA rows for progress prints."""
-    return f"[GVA {HV // H_qk}x]" if HV > H_qk else "[MHA]"
+def _gva_hint():
+    """Return a short tag marking GVA vs MHA mode for progress prints."""
+    return f"[GVA {HV // H}x]" if HV > H else "[MHA]"
 
 
 # ============================================================
-# Fixed-length benchmark (GVA-aware via per-config HV)
+# Fixed-length benchmark (GVA when global HV > H)
 # ============================================================
 def bench_fixed(configs):
     print("\n" + "=" * 100)
@@ -202,8 +177,8 @@ def bench_fixed(configs):
     results = []
 
     for cfg in configs:
-        B, T, H_qk, HV = _normalize_fixed_config(cfg)
-        print(f"  {_gva_hint(H_qk, HV):>9s}  B={B} T={T} H={H_qk} HV={HV}")
+        B, T = cfg
+        print(f"  {_gva_hint():>9s}  B={B} T={T} H={H} HV={HV}")
         set_seed(SEED)
         device = torch.device("cuda")
         torch.cuda.empty_cache()
@@ -214,7 +189,7 @@ def bench_fixed(configs):
         inputs = prepare_safe_gate_inputs(
             B,
             T,
-            H_qk,
+            H,
             D,
             device,
             cu_seqlens=cu_seqlens,
@@ -255,7 +230,7 @@ def bench_fixed(configs):
             {
                 "B": B,
                 "T": T,
-                "H": H_qk,
+                "H": H,
                 "HV": HV,
                 "rmse": rmse,
                 "rel_max": rel_max,
@@ -273,7 +248,7 @@ def bench_fixed(configs):
 
 
 # ============================================================
-# Varlen benchmark (GVA-aware via per-config HV)
+# Varlen benchmark (GVA when global HV > H)
 # ============================================================
 def bench_varlen(configs):
     print("\n" + "=" * 100)
@@ -282,8 +257,8 @@ def bench_varlen(configs):
     results = []
 
     for cfg in configs:
-        seq_lens, total_len, dist, H_qk, HV = _normalize_varlen_config(cfg)
-        print(f"  {_gva_hint(H_qk, HV):>9s}  {dist} {len(seq_lens)}seqs T={total_len} H={H_qk} HV={HV}")
+        seq_lens, total_len, dist = cfg
+        print(f"  {_gva_hint():>9s}  {dist} {len(seq_lens)}seqs T={total_len} H={H} HV={HV}")
         set_seed(SEED)
         device = torch.device("cuda")
         torch.cuda.empty_cache()
@@ -294,7 +269,7 @@ def bench_varlen(configs):
         inputs = prepare_safe_gate_inputs(
             1,
             T,
-            H_qk,
+            H,
             D,
             device,
             cu_seqlens=cu_seqlens,
@@ -342,7 +317,7 @@ def bench_varlen(configs):
                 "dist": dist,
                 "T_total": T,
                 "n_seqs": n_seqs,
-                "H": H_qk,
+                "H": H,
                 "HV": HV,
                 "rmse": rmse,
                 "rel_max": rel_max,
@@ -368,7 +343,8 @@ def print_report(fixed_results, varlen_results):
     print("                  BENCHMARK REPORT: cula_kda_fused_fwd (fully-fused)")
     print(f"                  cuLA {_SM_TAG} fully-fused vs FLA Triton")
     print(f"                  D={D}  dtype=bf16  safe_gate=True  has_init_state={HAS_INIT_STATE}")
-    print("                  GVA rows are those with HV > H (H, HV shown per row).")
+    gva_note = f"GVA enabled (HV={HV} > H={H}, ratio={HV // H}x)" if HV > H else f"MHA (HV=H={H})"
+    print(f"                  {gva_note}")
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
     mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
@@ -424,12 +400,7 @@ def main():
         type=str,
         default="both",
         choices=["fixed", "varlen", "both"],
-        help=(
-            "Which benchmark mode to run (default: both). "
-            "GVA rows (HV > H) are mixed in alongside MHA rows (HV == H) "
-            "under the same sequence-length settings, so GVA and MHA can be "
-            "compared side by side."
-        ),
+        help="Which benchmark mode to run (default: both).",
     )
     parser.add_argument(
         "--ncu",
@@ -446,9 +417,15 @@ def main():
         action="store_true",
         help="Use non-zero initial state (default: False)",
     )
+    parser.add_argument(
+        "--hv",
+        type=int,
+        default=None,
+        help=f"Override number of V heads (HV). Default: H ({H}, no GVA). Set HV > H to run all configs in GVA mode.",
+    )
     args = parser.parse_args()
 
-    global NCU_MODE, SANITIZER_MODE, HAS_INIT_STATE
+    global NCU_MODE, SANITIZER_MODE, HAS_INIT_STATE, HV
     if args.ncu:
         NCU_MODE = True
         print("[NCU mode] warmup=1, iters=1")
@@ -458,50 +435,36 @@ def main():
     if args.init_state:
         HAS_INIT_STATE = True
         print("[init_state] using non-zero initial state")
+    if args.hv is not None:
+        if args.hv < H or args.hv % H != 0:
+            raise ValueError(f"--hv must be a positive multiple of H ({H}), got {args.hv}")
+        HV = args.hv
+        if HV > H:
+            print(f"[GVA] HV={HV} (H={H}, ratio={HV // H}x)")
 
     print(
         f"[Device] {torch.cuda.get_device_name(0)}  compute capability {_SM_TAG}  →  using {cula_kda_fused_fwd.__module__}.{cula_kda_fused_fwd.__name__}"
     )
 
     # ------------------------------------------------------------------
-    # Fixed-length configs — MHA and GVA rows share the same (B, T) grid.
-    #   (B, T)                 → MHA  (H_qk = HV = default H)
-    #   (B, T, H_qk, HV)       → GVA when HV > H_qk (HV must be a multiple of H_qk)
+    # Fixed-length configs — (B, T). Per-row H/HV defaults to global H/HV
+    # (HV overridable via --hv to switch all rows into GVA mode).
     # ------------------------------------------------------------------
     fixed_configs = [
-        # MHA (HV == H):
         (1, 1024),
         (1, 4096),
         (1, 8192),
         (1, 16384),
         (2, 4096),
         (2, 8192),
-        # GVA (HV > H) at the same (B, T) shapes for side-by-side comparison:
-        (1, 1024, 16, 64),   # 4x
-        (1, 4096, 16, 64),   # 4x
-        (1, 8192, 16, 64),   # 4x
-        (1, 16384, 16, 64),  # 4x
-        (1, 4096, 32, 64),   # 2x
-        (1, 8192, 32, 64),   # 2x
-        (1, 4096, 8, 64),    # 8x
-        (1, 8192, 8, 64),    # 8x
-        (2, 4096, 16, 64),   # 4x
-        (2, 8192, 16, 64),   # 4x
     ]
 
-    # Varlen configs — identical sequence-length layouts replayed with and
-    # without GVA so MHA and GVA can be compared row-by-row.
-    varlen_configs_base = build_varlen_configs(
+    # Varlen configs — same layout as fixed; HV is controlled globally via --hv.
+    varlen_configs = build_varlen_configs(
         num_seqs_list=(10, 20),
         total_lens=(4096, 8192),
         dists=("uniform", "random", "skewed"),
     )
-    gva_varlen_mixed = [
-        (seq_lens, T, dist, H_qk, HV)
-        for (H_qk, HV) in ((16, 64), (32, 64))
-        for (seq_lens, T, dist) in varlen_configs_base
-    ]
-    varlen_configs = list(varlen_configs_base) + gva_varlen_mixed
 
     fixed_res, varlen_res = [], []
 

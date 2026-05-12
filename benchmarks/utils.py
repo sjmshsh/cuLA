@@ -293,12 +293,8 @@ def prepare_safe_gate_inputs(
             GVA) and on FLA's `chunk_kda`.
 
     All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
-    The returned dict always contains `H` and `HV` keys so callers can report
-    the effective head counts uniformly.
     """
     HV = H if num_v_heads is None else num_v_heads
-    assert H > 0, f"H must be positive, got {H}."
-    assert HV > 0, f"HV must be positive, got {HV}."
     assert HV % H == 0, f"HV ({HV}) must be a positive multiple of H ({H})."
 
     dtype = torch.bfloat16
@@ -352,8 +348,6 @@ def prepare_safe_gate_inputs(
         chunk_indices=chunk_indices,
         init_state=init_state,
         lower_bound=-5.0,
-        H=H,
-        HV=HV,
     )
 
 
