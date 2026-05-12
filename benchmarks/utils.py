@@ -269,33 +269,10 @@ def prepare_safe_gate_inputs(
 ):
     """Prepare inputs for safe_gate benchmarks (use_gate_in_kernel=True, safe_gate=True).
 
-    Args:
-        batch_size: Batch size `B`.
-        T: Per-sequence length.
-        H: Number of Q/K heads (the "group" count, must be > 0).
-        D: Head dimension.
-        device: torch device.
-        cu_seqlens: Optional cumulative sequence lengths for varlen.
-        chunk_size: Chunk size for `prepare_chunk_indices`.
-        seed: RNG seed.
-        has_init_state: Whether to allocate a non-zero initial state.
-        num_v_heads: Optional number of V heads (HV). Defaults to `H` (no GVA).
-            When `HV > H`, GVA (Grouped Value Attention) is enabled:
-              - v/g/beta are allocated with HV heads.
-              - q/k/g/beta are expanded from H to HV heads via
-                `repeat_interleave(..., dim=head)`, equivalent to the einops
-                pattern `repeat(x, "... h d -> ... (h g) d")` used by
-                `fla.layers.kda`.
-              - `A_log` / `dt_bias` are sized to HV because FLA's
-                `kda_gate_chunk_cumsum` indexes them per head of `g`.
-            This expanded layout works on both cuLA backends (SM100 requires
-            q.shape[-2] == v.shape[-2]; SM90 accepts both native and expanded
-            GVA) and on FLA's `chunk_kda`.
-
     All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
     """
     HV = H if num_v_heads is None else num_v_heads
-    assert HV % H == 0, f"HV ({HV}) must be a positive multiple of H ({H})."
+    assert HV >= H and HV % H == 0, f"HV ({HV}) must be a positive multiple of H ({H}) with HV >= H."
 
     dtype = torch.bfloat16
     scale = D ** (-0.5)
@@ -303,10 +280,6 @@ def prepare_safe_gate_inputs(
     set_seed(seed)
 
     # Allocate native GVA shapes:
-    #   q, k: (B, T, H, D)
-    #   v, g: (B, T, HV, D)
-    #   beta: (B, T, HV)
-    # When HV == H this collapses to the standard non-GVA layout.
     q = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
     k = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
     v = torch.randn(batch_size, T, HV, D, dtype=dtype, device=device).requires_grad_(False)
