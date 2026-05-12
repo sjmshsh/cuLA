@@ -451,18 +451,23 @@ def main():
     # (HV overridable via --hv to switch all rows into GVA mode).
     # ------------------------------------------------------------------
     fixed_configs = [
+        # (B, T)
+        (1, 512),
         (1, 1024),
         (1, 4096),
         (1, 8192),
         (1, 16384),
+        (2, 512),
+        (2, 1024),
         (2, 4096),
         (2, 8192),
+        (2, 16384),
     ]
 
     # Varlen configs — same layout as fixed; HV is controlled globally via --hv.
     varlen_configs = build_varlen_configs(
         num_seqs_list=(10, 20),
-        total_lens=(4096, 8192),
+        total_lens=(4096, 8192, 16384),
         dists=("uniform", "random", "skewed"),
     )
 
