@@ -25,10 +25,9 @@ Compares:
   - Accuracy: RMSE, relative max diff between cuLA fully-fused and FLA Triton
   - Performance: kernel execution time (ms) with CUDA events
 
-Modes (--mode, default: both):
-  - fixed:  Fixed-length (B, T) sequences.
-  - varlen: Variable-length sequences with 2-3x length variation.
-  - both:   Run fixed + varlen (default).
+Modes:
+  - Fixed-length: various (B, T) configs
+  - Varlen: sequences with 2-3x length variation
 
 H (number of Q/K heads) is a module-level constant; HV (number of V heads)
 defaults to H and can be overridden globally via --hv to run every config in
@@ -160,14 +159,6 @@ def run_cula(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, lo
 
 
 # ============================================================
-# GVA hint
-# ============================================================
-def _gva_hint():
-    """Return a short tag marking GVA vs MHA mode for progress prints."""
-    return f"[GVA {HV // H}x]" if HV > H else "[MHA]"
-
-
-# ============================================================
 # Fixed-length benchmark (GVA when global HV > H)
 # ============================================================
 def bench_fixed(configs):
@@ -178,7 +169,6 @@ def bench_fixed(configs):
 
     for cfg in configs:
         B, T = cfg
-        print(f"  {_gva_hint():>9s}  B={B} T={T} H={H} HV={HV}")
         set_seed(SEED)
         device = torch.device("cuda")
         torch.cuda.empty_cache()
@@ -258,7 +248,6 @@ def bench_varlen(configs):
 
     for cfg in configs:
         seq_lens, total_len, dist = cfg
-        print(f"  {_gva_hint():>9s}  {dist} {len(seq_lens)}seqs T={total_len} H={H} HV={HV}")
         set_seed(SEED)
         device = torch.device("cuda")
         torch.cuda.empty_cache()
