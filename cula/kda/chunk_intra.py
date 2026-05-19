@@ -383,7 +383,6 @@ def chunk_kda_bwd_kernel_intra(
     B,
     T,
     H: tl.constexpr,
-    HV: tl.constexpr,
     K: tl.constexpr,
     BT: tl.constexpr,
     BC: tl.constexpr,
@@ -393,12 +392,8 @@ def chunk_kda_bwd_kernel_intra(
     SAFE_GATE: tl.constexpr,
     USE_GATHER: tl.constexpr,
 ):
-    # H  = HQK (qk-head count); q/k/dq/dk use H stride.
-    # HV = v-head count; g/beta/dAqk/dAkk/dg/db use HV stride.
-    # Grid enumerates B * HV: i_h is the v-head index, i_hqk is the qk-head.
     i_kc, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_b, i_h = i_bh // HV, i_bh % HV
-    i_hqk = i_h // (HV // H)
+    i_b, i_h = i_bh // H, i_bh % H
     i_k, i_i = i_kc // NC, i_kc % NC
 
     all = B * T
@@ -416,38 +411,38 @@ def chunk_kda_bwd_kernel_intra(
     o_k = i_k * BK + tl.arange(0, BK)
     m_k = o_k < K
 
-    q += (bos * H + i_hqk) * K
-    k += (bos * H + i_hqk) * K
-    g += (bos * HV + i_h) * K
-    beta += bos * HV + i_h
+    q += (bos * H + i_h) * K
+    k += (bos * H + i_h) * K
+    g += (bos * H + i_h) * K
+    beta += bos * H + i_h
 
-    dAqk += (bos * HV + i_h) * BT
-    dAkk += (bos * HV + i_h) * BT
-    dq += (bos * H + i_hqk) * K
-    dq2 += (bos * H + i_hqk) * K
-    dk += (bos * H + i_hqk) * K
-    dk2 += (bos * H + i_hqk) * K
-    dg += (bos * HV + i_h) * K
-    dg2 += (bos * HV + i_h) * K
-    db += (i_k * all + bos) * HV + i_h
+    dAqk += (bos * H + i_h) * BT
+    dAkk += (bos * H + i_h) * BT
+    dq += (bos * H + i_h) * K
+    dq2 += (bos * H + i_h) * K
+    dk += (bos * H + i_h) * K
+    dk2 += (bos * H + i_h) * K
+    dg += (bos * H + i_h) * K
+    dg2 += (bos * H + i_h) * K
+    db += (i_k * all + bos) * H + i_h
 
-    p_g = tl.make_block_ptr(g, (T, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+    p_g = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
     b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
 
-    p_b = tl.make_block_ptr(beta, (T,), (HV,), (i_ti,), (BC,), (0,))
+    p_b = tl.make_block_ptr(beta, (T,), (H,), (i_ti,), (BC,), (0,))
     b_b = tl.load(p_b, boundary_check=(0,))
 
     b_dq2 = tl.zeros([BC, BK], dtype=tl.float32)
     b_dk2 = tl.zeros([BC, BK], dtype=tl.float32)
     if i_i > 0:
-        p_gn = g + i_ti * HV * K + o_k
+        p_gn = g + i_ti * H * K + o_k
         # [BK,]
         b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)[None, :]
         for i_j in range(0, i_i):
             p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
-            p_gk = tl.make_block_ptr(g, (T, K), (HV * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
-            p_dAqk = tl.make_block_ptr(dAqk, (T, BT), (HV * BT, 1), (i_ti, i_j * BC), (BC, BC), (1, 0))
-            p_dAkk = tl.make_block_ptr(dAkk, (T, BT), (HV * BT, 1), (i_ti, i_j * BC), (BC, BC), (1, 0))
+            p_gk = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
+            p_dAqk = tl.make_block_ptr(dAqk, (T, BT), (H * BT, 1), (i_ti, i_j * BC), (BC, BC), (1, 0))
+            p_dAkk = tl.make_block_ptr(dAkk, (T, BT), (H * BT, 1), (i_ti, i_j * BC), (BC, BC), (1, 0))
             # [BC, BK]
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_gk = tl.load(p_gk, boundary_check=(0, 1))
@@ -464,9 +459,9 @@ def chunk_kda_bwd_kernel_intra(
 
     o_i = tl.arange(0, BC)
     m_dA = (i_ti + o_i) < T
-    o_dA = (i_ti + o_i) * HV * BT + i_i * BC
+    o_dA = (i_ti + o_i) * H * BT + i_i * BC
     p_kj = k + i_ti * H * K + o_k
-    p_gkj = g + i_ti * HV * K + o_k
+    p_gkj = g + i_ti * H * K + o_k
 
     p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
     p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
@@ -480,8 +475,8 @@ def chunk_kda_bwd_kernel_intra(
             p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)) * H * K + o_k
             b_gn = tl.load(p_gn, mask=m_k, other=0)[None, :]
 
-        p_dAqk = tl.make_block_ptr(dAqk, (T, BT), (HV * BT, 1), (i_ti, i_i * BC), (BC, BC), (1, 0))
-        p_dAkk = tl.make_block_ptr(dAkk, (T, BT), (HV * BT, 1), (i_ti, i_i * BC), (BC, BC), (1, 0))
+        p_dAqk = tl.make_block_ptr(dAqk, (T, BT), (H * BT, 1), (i_ti, i_i * BC), (BC, BC), (1, 0))
+        p_dAkk = tl.make_block_ptr(dAkk, (T, BT), (H * BT, 1), (i_ti, i_i * BC), (BC, BC), (1, 0))
         b_dAqk_diag_qk = tl.load(p_dAqk, boundary_check=(0, 1)).to(tl.float32)
         b_dAkk_diag_qk = tl.load(p_dAkk, boundary_check=(0, 1)).to(tl.float32)
 
@@ -512,15 +507,15 @@ def chunk_kda_bwd_kernel_intra(
             b_dq2 += tl.where(m_i, b_dAqk[:, None] * b_kj[None, :] * b_gqk, 0.0)
             b_dk2 += tl.where(m_i, b_dAkk[:, None] * b_kj[None, :] * b_gqk, 0.0)
 
-            p_kj += H * K     # k stride: HQK
-            p_gkj += HV * K   # g stride: HV
+            p_kj += H * K
+            p_gkj += H * K
 
     b_db = tl.sum(b_dk2 * b_k, 1)
     b_dk2 *= b_b[:, None]
 
-    p_dq = tl.make_block_ptr(dq, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))   # H = HQK
-    p_dq2 = tl.make_block_ptr(dq2, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))  # H = HQK
-    p_db = tl.make_block_ptr(db, (T,), (HV,), (i_ti,), (BC,), (0,))
+    p_dq = tl.make_block_ptr(dq, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+    p_dq2 = tl.make_block_ptr(dq2, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+    p_db = tl.make_block_ptr(db, (T,), (H,), (i_ti,), (BC,), (0,))
 
     b_dg2 = b_q * b_dq2
     b_dq2 = b_dq2 + tl.load(p_dq, boundary_check=(0, 1))
@@ -532,16 +527,16 @@ def chunk_kda_bwd_kernel_intra(
 
     NC = min(NC, tl.cdiv(T - i_t * BT, BC))
     if i_i < NC - 1:
-        p_gn = g + (min(i_ti + BC, T) - 1) * HV * K + o_k
+        p_gn = g + (min(i_ti + BC, T) - 1) * H * K + o_k
         # [BK,]
         b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)[None, :]
         for i_j in range(i_i + 1, NC):
             p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
             p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
-            p_gk = tl.make_block_ptr(g, (T, K), (HV * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
-            p_b = tl.make_block_ptr(beta, (T,), (HV,), (i_t * BT + i_j * BC,), (BC,), (0,))
-            p_dAqk = tl.make_block_ptr(dAqk, (BT, T), (1, HV * BT), (i_i * BC, i_t * BT + i_j * BC), (BC, BC), (0, 1))
-            p_dAkk = tl.make_block_ptr(dAkk, (BT, T), (1, HV * BT), (i_i * BC, i_t * BT + i_j * BC), (BC, BC), (0, 1))
+            p_gk = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
+            p_b = tl.make_block_ptr(beta, (T,), (H,), (i_t * BT + i_j * BC,), (BC,), (0,))
+            p_dAqk = tl.make_block_ptr(dAqk, (BT, T), (1, H * BT), (i_i * BC, i_t * BT + i_j * BC), (BC, BC), (0, 1))
+            p_dAkk = tl.make_block_ptr(dAkk, (BT, T), (1, H * BT), (i_i * BC, i_t * BT + i_j * BC), (BC, BC), (0, 1))
             # [BC]
             b_b = tl.load(p_b, boundary_check=(0,))
             # [BC, BK]
@@ -563,25 +558,25 @@ def chunk_kda_bwd_kernel_intra(
             b_dkt += tl.dot(b_dAqk, b_qg)
             b_dkt += tl.dot(b_dAkk, b_kbg)
         b_dkt *= exp2(b_gn - b_g)
-    o_dA = i_ti * HV * BT + i_i * BC + o_i
+    o_dA = i_ti * H * BT + i_i * BC + o_i
     p_qj = q + i_ti * H * K + o_k
     p_kj = k + i_ti * H * K + o_k
-    p_gkj = g + i_ti * HV * K + o_k
-    p_bj = beta + i_ti * HV
+    p_gkj = g + i_ti * H * K + o_k
+    p_bj = beta + i_ti * H
 
     if SAFE_GATE:
         if USE_GATHER:
             b_gn = gather(b_g, tl.full([1, BK], min(BC // 2, T - i_ti - 1), dtype=tl.int16), axis=0)
         else:
-            p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)) * HV * K + o_k
+            p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)) * H * K + o_k
             b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)[None, :]
         p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
         b_q = tl.load(p_q, boundary_check=(0, 1))
-        p_b = tl.make_block_ptr(beta, (T,), (HV,), (i_ti,), (BC,), (0,))
+        p_b = tl.make_block_ptr(beta, (T,), (H,), (i_ti,), (BC,), (0,))
         b_b = tl.load(p_b, boundary_check=(0,))
 
-        p_dAqk = tl.make_block_ptr(dAqk, (BT, T), (1, HV * BT), (i_i * BC, i_ti), (BC, BC), (0, 1))
-        p_dAkk = tl.make_block_ptr(dAkk, (BT, T), (1, HV * BT), (i_i * BC, i_ti), (BC, BC), (0, 1))
+        p_dAqk = tl.make_block_ptr(dAqk, (BT, T), (1, H * BT), (i_i * BC, i_ti), (BC, BC), (0, 1))
+        p_dAkk = tl.make_block_ptr(dAkk, (BT, T), (1, H * BT), (i_i * BC, i_ti), (BC, BC), (0, 1))
         b_dAqk_diag_kk = tl.load(p_dAqk, boundary_check=(0, 1)).to(tl.float32)
         b_dAkk_diag_kk = tl.load(p_dAkk, boundary_check=(0, 1)).to(tl.float32)
 
@@ -603,8 +598,8 @@ def chunk_kda_bwd_kernel_intra(
     else:
         for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
             # [BC,]
-            b_dAqk = tl.load(dAqk + o_dA + j * HV * BT)
-            b_dAkk = tl.load(dAkk + o_dA + j * HV * BT)
+            b_dAqk = tl.load(dAqk + o_dA + j * H * BT)
+            b_dAkk = tl.load(dAkk + o_dA + j * H * BT)
             # [BK,]
             b_qj = tl.load(p_qj, mask=m_k, other=0).to(tl.float32)
             b_kbj = tl.load(p_kj, mask=m_k, other=0).to(tl.float32) * tl.load(p_bj)
@@ -615,14 +610,14 @@ def chunk_kda_bwd_kernel_intra(
             b_dkt += tl.where(m_i, b_dAqk[:, None] * b_qj[None, :] * b_gkq, 0.0)
             b_dkt += tl.where(m_i, b_dAkk[:, None] * b_kbj[None, :] * b_gkq, 0.0)
 
-            p_qj += H * K     # k-head stride for q
-            p_kj += H * K     # k-head stride for k
-            p_gkj += HV * K   # v-head stride for g
-            p_bj += HV        # v-head stride for beta
-    p_dk = tl.make_block_ptr(dk, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))   # H = HQK
-    p_dk2 = tl.make_block_ptr(dk2, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))  # H = HQK
-    p_dg = tl.make_block_ptr(dg, (T, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
-    p_dg2 = tl.make_block_ptr(dg2, (T, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+            p_qj += H * K
+            p_kj += H * K
+            p_gkj += H * K
+            p_bj += H
+    p_dk = tl.make_block_ptr(dk, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+    p_dk2 = tl.make_block_ptr(dk2, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+    p_dg = tl.make_block_ptr(dg, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+    p_dg2 = tl.make_block_ptr(dg2, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
 
     b_dg2 += (b_dk2 - b_dkt) * b_k + tl.load(p_dg, boundary_check=(0, 1))
     b_dk2 += tl.load(p_dk, boundary_check=(0, 1))
@@ -764,22 +759,7 @@ def chunk_kda_fwd_intra(
     unified_gref: bool = False,  # Set True for ~5% extra perf (slightly lower precision)
 ):
     assert safe_gate, "Only safe_gate=True is supported in chunk_kda_fwd_intra for now"
-    # GVA support: Q/K have head-dim HQK; V/g/beta/Aqk/Akk/w/u/kg/qg have head-dim HV.
-    # Pre-GVA behaviour is preserved when HV == HQK.
-    B, T, HQK, K = k.shape
-    HV = v.shape[2]
-    assert v.shape[0] == B and v.shape[1] == T, (
-        f"v must share (B, T) with k; got k.shape={k.shape}, v.shape={v.shape}"
-    )
-    assert HV > 0 and HQK > 0 and HV % HQK == 0, (
-        f"v head-dim (HV={HV}) must be a positive multiple of k head-dim (HQK={HQK})"
-    )
-    if gk is not None:
-        assert gk.shape[0] == B and gk.shape[1] == T and gk.shape[2] == HV, (
-            f"gk shape must be (B, T, HV={HV}, K); got {tuple(gk.shape)}"
-        )
-    if beta is not None:
-        assert beta.shape[-1] == HV, f"beta last dim must equal HV={HV}; got {tuple(beta.shape)}"
+    B, T, H, K = k.shape
     BT = chunk_size
 
     if cu_seqlens is None:
@@ -793,20 +773,18 @@ def chunk_kda_fwd_intra(
         "cu_seqlens and chunk_indices must be int32 for cuda impl"
     )
 
-    # Aqk/Akk are produced per v-head (they live in v-head space because g/beta are per v-head).
-    Aqk = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
-    Akk = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
+    Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
+    Akk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
 
     tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
     cula_cuda.chunk_kda_fwd_intra_cuda(
         q, k, gk, beta, cu_seqlens, chunk_indices, Aqk, Akk, tile_counter, scale, chunk_size, use_tf32_inverse, unified_gref
     )
 
-    # w/u/kg/qg are all per-v-head outputs.
-    w = torch.empty(B, T, HV, K, device=k.device, dtype=k.dtype)
+    w = torch.empty_like(k)
     u = torch.empty_like(v)
-    qg = torch.empty(B, T, HV, K, device=q.device, dtype=q.dtype) if disable_recompute else None
-    kg = torch.empty(B, T, HV, K, device=k.device, dtype=k.dtype) if gk is not None else None
+    qg = torch.empty_like(q) if disable_recompute else None
+    kg = torch.empty_like(k) if gk is not None else None
 
     cula_cuda.recompute_w_u_cuda(
         k, v, beta, Akk, gk, cu_seqlens, chunk_indices, w, u, kg, chunk_size, q if disable_recompute else None, qg
@@ -831,9 +809,7 @@ def chunk_kda_bwd_intra(
     chunk_size: int = 64,
     safe_gate: bool = False,
 ):
-    B, T, HQK, K = k.shape
-    # g/beta/dAqk/dAkk/dg/db live in v-head space (HV).
-    HV = g.shape[2]
+    B, T, H, K = k.shape
     BT = chunk_size
     BC = min(16, BT)
     BK = min(32, triton.next_power_of_2(K))
@@ -844,12 +820,11 @@ def chunk_kda_bwd_intra(
     NC = triton.cdiv(BT, BC)
     NK = triton.cdiv(K, BK)
 
-    # dq2/dk2 are in qk-head space; db2/dg2 are in v-head space.
     dq2 = torch.empty_like(q)
     dk2 = torch.empty_like(k)
     db2 = beta.new_empty(NK, *beta.shape, dtype=torch.float)
     dg2 = torch.empty_like(dg, dtype=torch.float)
-    grid = (NK * NC, NT, B * HV)
+    grid = (NK * NC, NT, B * H)
     chunk_kda_bwd_kernel_intra[grid](
         q=q,
         k=k,
@@ -868,8 +843,7 @@ def chunk_kda_bwd_intra(
         chunk_indices=chunk_indices,
         B=B,
         T=T,
-        H=HQK,
-        HV=HV,
+        H=H,
         K=K,
         BT=BT,
         BC=BC,
