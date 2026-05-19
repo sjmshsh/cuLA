@@ -83,7 +83,7 @@ def assert_hopper(device: torch.device | str | int | None = None) -> None:
 def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callable:
     """Return the appropriate ``kda_prefill`` implementation for *device*.
 
-    - sm100/sm103 (Blackwell) → NotImplementedError
+    - sm100/sm103 (Blackwell) → cula.kda.kda_prefill_blackwell (not yet available)
     - sm90  (Hopper)          → cula.kda.kda_prefill_hopper
 
     Args:

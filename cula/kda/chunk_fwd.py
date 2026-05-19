@@ -126,17 +126,10 @@ def chunk_kda_fwd(
         # only the first state in the tensor is relevant. We compress it to optimize memory for `save_for_backward`.
         initial_state = compress_h0(initial_state, context=cp_context)
 
-    # GVA: if HQK < HV, broadcast q from HQK heads to HV heads so fwd_o sees
-    # consistent head dimensions. repeat_interleave mirrors the broadcast semantics
-    # already used inside chunk_kda_fwd_intra (each QK head paired with
-    # heads_per_group = HV // HQK consecutive V heads).
-    HQK, HV = q.shape[2], v.shape[2]
-    q_fwd_o = q.repeat_interleave(HV // HQK, dim=2) if HV != HQK else q
-
     # Please ensure zeros, since vllm will use padding v
     o = torch.zeros_like(v)
     chunk_gla_fwd_o(
-        q=q_fwd_o,
+        q=q,
         v=v_new,
         g=g,
         A=Aqk,
