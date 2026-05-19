@@ -366,3 +366,54 @@ def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_siz
     )
 
     return q, k, v, g, beta, scale, cu_seqlens, chunk_indices
+
+
+def prepare_intra_inputs_gva(
+    batch_size, T, HQK, HV, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED
+):
+    """Prepare preprocessed inputs for chunk_kda_fwd_intra with GVA (HV >= HQK).
+
+    GVA layout:
+        q, k  : (batch_size_flat, T, HQK, D)  — Q/K head space
+        v     : (batch_size_flat, T, HV,  D)  — V head space
+        g     : (batch_size_flat, T, HV,  D)  — gate in V head space (after cumsum)
+        beta  : (batch_size_flat, T, HV)       — beta in V head space
+
+    When HV == HQK (group_size == 1) this is identical to prepare_intra_inputs.
+    All tensors are flattened to batch_size=1 for cu_seqlens compatibility.
+    """
+    assert HV > 0 and HQK > 0 and HV % HQK == 0, f"HV ({HV}) must be a positive multiple of HQK ({HQK})"
+    dtype = torch.bfloat16
+    scale = D ** (-0.5)
+
+    set_seed(seed)
+
+    q = torch.randn(batch_size, T, HQK, D, dtype=dtype, device=device)
+    k = torch.randn(batch_size, T, HQK, D, dtype=dtype, device=device)
+    v = torch.randn(batch_size, T, HV, D, dtype=dtype, device=device)
+    g_raw = torch.randn(batch_size, T, HV, D, dtype=dtype, device=device)
+    beta = torch.randn(batch_size, T, HV, dtype=torch.float, device=device).sigmoid()
+
+    q, _ = l2norm_fwd(q)
+    k, _ = l2norm_fwd(k)
+
+    if batch_size != 1:
+        q, k, v, g_raw, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g_raw, beta))
+
+    A_log = torch.randn(HV, dtype=torch.float, device=device)
+    dt_bias = torch.randn(HV * D, dtype=torch.float, device=device)
+
+    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
+
+    g = kda_gate_chunk_cumsum(
+        g=g_raw,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=RCP_LN2,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        lower_bound=-5.0,
+    )
+
+    return q, k, v, g, beta, scale, cu_seqlens, chunk_indices
