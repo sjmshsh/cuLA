@@ -379,10 +379,17 @@ def chunk_kda(
         if not (-5 <= lower_bound < 0):
             raise ValueError(f"`lower_bound` must be in the safe range [-5, 0), got {lower_bound}.")
 
-    assert q.shape == k.shape == g.shape, "q, k, g must have the same shape."
+    B, T, HQK, K_dim = q.shape
+    HV = g.shape[2]
+    assert q.shape == k.shape, "q and k must have the same shape."
+    assert q.shape[:2] == g.shape[:2], "q/k and g must share batch and sequence dimensions."
+    assert HV % HQK == 0 and HV >= HQK, (
+        f"g.shape[2] (HV={HV}) must be a positive multiple of q.shape[2] (HQK={HQK})."
+    )
+    assert g.shape == (B, T, HV, K_dim), f"g must be [B,T,HV,K]=({B},{T},{HV},{K_dim}), got {tuple(g.shape)}."
+    assert beta.shape[:3] == (B, T, HV), f"beta must have shape [B,T,HV,...], got {tuple(beta.shape)}."
+    assert v.shape[:3] == (B, T, HV), f"v must have shape [B,T,HV,...], got {tuple(v.shape)}."
     assert k.shape[-1] <= 256, "Currently we only support key headdim <=256 for KDA :-("
-    assert beta.shape == q.shape[:3], "beta must be of shape (batch size, seq len, num of head)."
-    assert v.shape == (*q.shape[:3], v.shape[-1]), "v must be of shape (batch size, seq len, num of head, head dim)."
     assert q.dtype == k.dtype == v.dtype == torch.bfloat16, "q, k, v must be in bfloat16."
     assert beta.dtype == torch.bfloat16 or beta.dtype == torch.float32, "beta must be in bfloat16 or float32."
     assert q.shape[-1] == k.shape[-1] == v.shape[-1] == 128, "Currently we only support head dim of 128 for KDA"

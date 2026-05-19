@@ -15,7 +15,7 @@
 
 """
 bench_kda.py — Benchmark: cuLA CuTe DSL vs FLA Triton baseline
-               for chunk_kda (KDA forward)
+               for chunk_kda (KDA training, fwd+bwd)
 
 Compares:
   - Accuracy: RMSE, relative max diff between cuLA and FLA outputs
@@ -25,8 +25,13 @@ Modes:
   - Fixed-length: B=1, B=2 with various T
   - Varlen: ~20 seqs with 2-3x length variation
 
+H (number of Q/K heads) is a module-level constant; HV (number of V heads)
+defaults to H and can be overridden globally via --hv to run every config in
+GVA mode.  In GVA mode cuLA receives native HQK q/k; FLA receives q/k
+expanded to HV heads.  HV must be a positive multiple of H.
+
 Usage:
-  python bench_kda.py [--mode fixed|varlen|both] [--ncu]
+  python bench_kda.py [--mode fixed|varlen|both] [--hv HV] [--ncu]
 
 With --ncu, warmup=1 and iters=1 for ncu profiling:
   ncu --set full -o report python bench_kda.py --mode varlen --ncu
@@ -48,6 +53,7 @@ from benchmarks.utils import (
     build_varlen_configs,
     exclusive_cumsum,
     prepare_safe_gate_inputs,
+    prepare_safe_gate_inputs_gva,
     set_seed,
 )
 from cula.kda import chunk_kda as cula_chunk_kda
@@ -55,7 +61,10 @@ from cula.kda import chunk_kda as cula_chunk_kda
 # ============================================================
 # Constants
 # ============================================================
+# H = QK head count; HV = V head count.  HV defaults to H (non-GVA / MHA).
+# Override via --hv to run every config in GVA mode (HV must be a multiple of H).
 H, D = 64, 128
+HV = H
 WARMUP = 10
 N_ITERS = 30
 NCU_MODE = False
@@ -162,74 +171,70 @@ def check_determinism(H=4, total_T=8192, num_seqs=10, iters=10000):
         assert torch.equal(state, ref_state), f"State mismatch at iter {i}"
 
 
+def _prepare_inputs(B, T, cu_seqlens):
+    """Return (inputs, q_fla, k_fla, q_cula, k_cula).
+
+    Non-GVA (HV == H): all four q/k are the same tensor.
+    GVA     (HV > H) : cuLA gets native HQK q/k; FLA gets q/k expanded to HV.
+    """
+    device = torch.device("cuda")
+    if HV > H:
+        inputs = prepare_safe_gate_inputs_gva(B, T, H, HV, D, device, cu_seqlens=cu_seqlens)
+        q_cula, k_cula = inputs["q"], inputs["k"]          # [B_flat, T, H,  D]
+        q_fla = q_cula.repeat_interleave(HV // H, dim=2).contiguous()  # [B_flat, T, HV, D]
+        k_fla = k_cula.repeat_interleave(HV // H, dim=2).contiguous()
+    else:
+        inputs = prepare_safe_gate_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens)
+        q_cula = q_fla = inputs["q"]
+        k_cula = k_fla = inputs["k"]
+    return inputs, q_fla, k_fla, q_cula, k_cula
+
+
 # ============================================================
 # Fixed-length benchmark
 # ============================================================
 def bench_fixed(configs):
-    print("\n" + "=" * 100)
-    print(f" Fixed-Length Benchmark: cuLA CuTe DSL vs FLA Triton  disable_recompute={DISABLE_RECOMPUTE}")
-    print("=" * 100)
+    gva_note = f"GVA HV={HV} ({HV // H}x)" if HV > H else f"MHA HV=H={H}"
+    print("\n" + "=" * 110)
+    print(f" Fixed-Length Benchmark: cuLA CuTe DSL vs FLA Triton  {gva_note}  disable_recompute={DISABLE_RECOMPUTE}")
+    print("=" * 110)
     results = []
 
     for B, T in configs:
         set_seed(SEED)
-        device = torch.device("cuda")
         torch.cuda.empty_cache()
 
         seq_lens = [T] * B
-        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
+        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=torch.device("cuda"))
 
-        inputs = prepare_safe_gate_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens)
-        q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
+        inputs, q_fla, k_fla, q_cula, k_cula = _prepare_inputs(B, T, cu_seqlens)
+        v, g, beta = inputs["v"], inputs["g"], inputs["beta"]
         A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
         scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
 
-        common = dict(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            init_state=init_state,
-            cu_seqlens=cu_seqlens,
-            lower_bound=lower_bound,
-        )
+        _shared = dict(v=v, g=g, beta=beta, scale=scale, A_log=A_log, dt_bias=dt_bias,
+                       init_state=init_state, cu_seqlens=cu_seqlens, lower_bound=lower_bound)
+        common_fla  = dict(q=q_fla,  k=k_fla,  **_shared)
+        common_cula = dict(q=q_cula, k=k_cula, **_shared)
 
-        # Accuracy: compare outputs
-        o_fla, _ = run_kda(**common, fn=fla_chunk_kda)
-        o_cula, _ = run_kda(**common, fn=cula_chunk_kda)
+        # Accuracy
+        o_fla,  _ = run_kda(**common_fla,  fn=fla_chunk_kda)
+        o_cula, _ = run_kda(**common_cula, fn=cula_chunk_kda)
         torch.cuda.synchronize()
-
         rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
 
         # Performance
-        def fn_fla(**common_kw):
-            return lambda: run_kda(**common_kw, fn=fla_chunk_kda)
-
-        def fn_cula(**common_kw):
-            return lambda: run_kda(**common_kw, fn=cula_chunk_kda)
-
-        ms_fla = time_kernel(fn_fla(**common))
-        ms_cula = time_kernel(fn_cula(**common))
+        ms_fla  = time_kernel(lambda: run_kda(**common_fla,  fn=fla_chunk_kda))
+        ms_cula = time_kernel(lambda: run_kda(**common_cula, fn=cula_chunk_kda))
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
-        r = {
-            "B": B,
-            "T": T,
-            "rmse": rmse,
-            "rel_max": rel_max,
-            "mean_diff": mean_diff,
-            "ms_fla": ms_fla,
-            "ms_cula": ms_cula,
-            "speedup": speedup,
-        }
-        results.append(r)
-        # print(f"  B={B:2d} T={T:5d}  done  ({speedup:.2f}x)")
+        results.append({
+            "B": B, "T": T, "H": H, "HV": HV,
+            "rmse": rmse, "rel_max": rel_max, "mean_diff": mean_diff,
+            "ms_fla": ms_fla, "ms_cula": ms_cula, "speedup": speedup,
+        })
 
-        del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
+        del o_fla, o_cula, inputs
         torch.cuda.empty_cache()
 
     return results
@@ -239,77 +244,51 @@ def bench_fixed(configs):
 # Varlen benchmark
 # ============================================================
 def bench_varlen(configs):
-    print("\n" + "=" * 100)
-    print(f" Varlen Benchmark: cuLA CuTe DSL vs FLA Triton  disable_recompute={DISABLE_RECOMPUTE}")
-    print("=" * 100)
+    gva_note = f"GVA HV={HV} ({HV // H}x)" if HV > H else f"MHA HV=H={H}"
+    print("\n" + "=" * 110)
+    print(f" Varlen Benchmark: cuLA CuTe DSL vs FLA Triton  {gva_note}  disable_recompute={DISABLE_RECOMPUTE}")
+    print("=" * 110)
     results = []
 
     for seq_lens, total_len, dist in configs:
         set_seed(SEED)
-        device = torch.device("cuda")
         torch.cuda.empty_cache()
 
         T = total_len
-        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
+        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=torch.device("cuda"))
 
-        inputs = prepare_safe_gate_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens)
-        q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
+        inputs, q_fla, k_fla, q_cula, k_cula = _prepare_inputs(1, T, cu_seqlens)
+        v, g, beta = inputs["v"], inputs["g"], inputs["beta"]
         A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
         scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
 
-        common = dict(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            init_state=init_state,
-            cu_seqlens=cu_seqlens,
-            lower_bound=lower_bound,
-        )
+        _shared = dict(v=v, g=g, beta=beta, scale=scale, A_log=A_log, dt_bias=dt_bias,
+                       init_state=init_state, cu_seqlens=cu_seqlens, lower_bound=lower_bound)
+        common_fla  = dict(q=q_fla,  k=k_fla,  **_shared)
+        common_cula = dict(q=q_cula, k=k_cula, **_shared)
 
         # Accuracy
-        o_fla, _ = run_kda(**common, fn=fla_chunk_kda)
-        o_cula, _ = run_kda(**common, fn=cula_chunk_kda)
+        o_fla,  _ = run_kda(**common_fla,  fn=fla_chunk_kda)
+        o_cula, _ = run_kda(**common_cula, fn=cula_chunk_kda)
         torch.cuda.synchronize()
-
         rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
 
         # Performance
-        def fn_fla(**common_kw):
-            return lambda: run_kda(**common_kw, fn=fla_chunk_kda)
-
-        def fn_cula(**common_kw):
-            return lambda: run_kda(**common_kw, fn=cula_chunk_kda)
-
-        ms_fla = time_kernel(fn_fla(**common))
-        ms_cula = time_kernel(fn_cula(**common))
+        ms_fla  = time_kernel(lambda: run_kda(**common_fla,  fn=fla_chunk_kda))
+        ms_cula = time_kernel(lambda: run_kda(**common_cula, fn=cula_chunk_kda))
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         n_seqs = len(seq_lens)
-        min_l, max_l = min(seq_lens), max(seq_lens)
-        avg_l = T // n_seqs
-        tag = f"{dist:>7s} {n_seqs:>2d}seqs T={T} [{min_l}..{max_l}] avg={avg_l}"
+        tag = f"{dist:>7s} {n_seqs:>2d}seqs T={T} [{min(seq_lens)}..{max(seq_lens)}] avg={T // n_seqs}"
 
-        r = {
-            "tag": tag,
-            "dist": dist,
-            "T_total": T,
-            "n_seqs": n_seqs,
-            "rmse": rmse,
-            "rel_max": rel_max,
-            "mean_diff": mean_diff,
-            "ms_fla": ms_fla,
-            "ms_cula": ms_cula,
-            "speedup": speedup,
-        }
-        results.append(r)
-        # print(f"  {tag:45s}  done  ({speedup:.2f}x)")
+        results.append({
+            "tag": tag, "dist": dist, "T_total": T, "n_seqs": n_seqs,
+            "H": H, "HV": HV,
+            "rmse": rmse, "rel_max": rel_max, "mean_diff": mean_diff,
+            "ms_fla": ms_fla, "ms_cula": ms_cula, "speedup": speedup,
+        })
 
-        del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
+        del o_fla, o_cula, inputs
         torch.cuda.empty_cache()
 
     return results
@@ -319,11 +298,13 @@ def bench_varlen(configs):
 # Report
 # ============================================================
 def print_report(fixed_results, varlen_results):
-    sep = "=" * 110
+    sep = "=" * 120
     print(f"\n\n{sep}")
     print("                       BENCHMARK REPORT: chunk_kda")
     print("                       cuLA CuTe DSL vs FLA Triton")
-    print(f"                       H={H}  D={D}  dtype=bf16  safe_gate=True  disable_recompute={DISABLE_RECOMPUTE}")
+    print(f"                       D={D}  dtype=bf16  safe_gate=True  disable_recompute={DISABLE_RECOMPUTE}")
+    gva_note = f"GVA enabled (HV={HV} > H={H}, ratio={HV // H}x)" if HV > H else f"MHA (HV=H={H})"
+    print(f"                       {gva_note}")
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
     mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
@@ -332,32 +313,39 @@ def print_report(fixed_results, varlen_results):
 
     if fixed_results:
         print("\n  [Fixed-Length]")
-        print(f"  {'─' * 85}")
+        print(f"  {'─' * 110}")
         print(
-            f"  {'B':>3s}  {'T':>5s}  │  {'RMSE':>10s}  {'rel_max':>10s}"
-            f"  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>11s}  {'Speedup':>8s}"
+            f"  {'B':>3s}  {'T':>6s}  {'H':>3s}  {'HV':>3s}  {'GVA':>4s}  │  "
+            f"{'RMSE':>10s}  {'rel_max':>10s}  │  "
+            f"{'FLA(ms)':>9s}  {'cuLA(ms)':>11s}  {'Speedup':>8s}"
         )
-        print(f"  {'─' * 85}")
+        print(f"  {'─' * 110}")
         for r in fixed_results:
+            gva_tag = f"{r['HV'] // r['H']}x" if r["HV"] > r["H"] else "no"
             print(
-                f"  {r['B']:3d}  {r['T']:5d}  │  "
+                f"  {r['B']:3d}  {r['T']:6d}  {r['H']:3d}  {r['HV']:3d}  {gva_tag:>4s}  │  "
                 f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cula']:11.4f}  {r['speedup']:7.2f}x"
             )
-        print(f"  {'─' * 85}")
+        print(f"  {'─' * 110}")
 
     if varlen_results:
         print("\n  [Varlen]")
-        print(f"  {'─' * 100}")
-        print(f"  {'Config':>45s}  │  {'RMSE':>10s}  {'rel_max':>10s}  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>11s}  {'Speedup':>8s}")
-        print(f"  {'─' * 100}")
+        print(f"  {'─' * 120}")
+        print(
+            f"  {'Config':>45s}  {'H':>3s}  {'HV':>3s}  {'GVA':>4s}  │  "
+            f"{'RMSE':>10s}  {'rel_max':>10s}  │  "
+            f"{'FLA(ms)':>9s}  {'cuLA(ms)':>11s}  {'Speedup':>8s}"
+        )
+        print(f"  {'─' * 120}")
         for r in varlen_results:
+            gva_tag = f"{r['HV'] // r['H']}x" if r["HV"] > r["H"] else "no"
             print(
-                f"  {r['tag']:>45s}  │  "
+                f"  {r['tag']:>45s}  {r['H']:3d}  {r['HV']:3d}  {gva_tag:>4s}  │  "
                 f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cula']:11.4f}  {r['speedup']:7.2f}x"
             )
-        print(f"  {'─' * 100}")
+        print(f"  {'─' * 120}")
 
     print(f"\n{sep}\n")
 
@@ -389,9 +377,15 @@ def main():
         action="store_true",
         help="Disable recompute in both FLA and cuLA (pre-compute QG)",
     )
+    parser.add_argument(
+        "--hv",
+        type=int,
+        default=None,
+        help=f"Override number of V heads (HV). Default: H ({H}, no GVA). Set HV > H for GVA mode.",
+    )
     args = parser.parse_args()
 
-    global NCU_MODE, SANITIZER_MODE, DISABLE_RECOMPUTE
+    global NCU_MODE, SANITIZER_MODE, DISABLE_RECOMPUTE, HV
     if args.ncu:
         NCU_MODE = True
         print("[NCU mode] warmup=1, iters=1")
@@ -401,6 +395,12 @@ def main():
     if args.disable_recompute:
         DISABLE_RECOMPUTE = True
         print("[Disable recompute] pre-compute QG in forward")
+    if args.hv is not None:
+        if args.hv < H or args.hv % H != 0:
+            raise ValueError(f"--hv must be a positive multiple of H ({H}), got {args.hv}")
+        HV = args.hv
+        if HV > H:
+            print(f"[GVA] HV={HV} (H={H}, ratio={HV // H}x)")
 
     fixed_configs = [
         # (B, T)
@@ -434,6 +434,7 @@ def main():
         varlen_res = bench_varlen(varlen_configs)
 
     print_report(fixed_res, varlen_res)
+
     return fixed_res, varlen_res
 
 

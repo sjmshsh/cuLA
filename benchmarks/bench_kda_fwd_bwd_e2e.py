@@ -29,8 +29,13 @@ Phases:
   - forward: forward pass only
   - e2e: forward + backward (end-to-end)
 
+H (number of Q/K heads) is a module-level constant; HV (number of V heads)
+defaults to H and can be overridden globally via --hv to run every config in
+GVA mode.  In GVA mode cuLA receives native HQK q/k; FLA receives q/k
+expanded to HV heads.  HV must be a positive multiple of H.
+
 Usage:
-  python bench_kda_fwd_bwd_e2e.py [--mode fixed|varlen|both] [--phase forward|e2e] [--ncu]
+  python bench_kda_fwd_bwd_e2e.py [--mode fixed|varlen|both] [--phase forward|e2e] [--hv HV] [--ncu]
 
 With --ncu, warmup=1 and iters=1 for ncu profiling:
   ncu --set full -o report python bench_kda_fwd_bwd_e2e.py --mode varlen --ncu
@@ -53,6 +58,7 @@ from benchmarks.utils import (
     exclusive_cumsum,
     generate_random_seq_lens,
     prepare_safe_gate_inputs,
+    prepare_safe_gate_inputs_gva,
     set_seed,
 )
 from cula.kda import chunk_kda as cula_chunk_kda
@@ -60,7 +66,10 @@ from cula.kda import chunk_kda as cula_chunk_kda
 # ============================================================
 # Constants
 # ============================================================
+# H = QK head count; HV = V head count.  HV defaults to H (non-GVA / MHA).
+# Override via --hv to run every config in GVA mode (HV must be a multiple of H).
 H, D = 64, 128
+HV = H
 WARMUP = 25
 N_ITERS = 100
 NCU_MODE = False
@@ -226,113 +235,116 @@ def check_determinism(num_seqs=5, T=512, iters=20):
     return True
 
 
+def _prepare_inputs_e2e(B, T, cu_seqlens):
+    """Return (inputs, q_fla, k_fla, q_cula, k_cula).
+
+    Non-GVA (HV == H): all four q/k are the same tensor.
+    GVA     (HV > H) : cuLA gets native HQK q/k; FLA gets q/k expanded to HV.
+    """
+    device = torch.device("cuda")
+    if HV > H:
+        inputs = prepare_safe_gate_inputs_gva(B, T, H, HV, D, device, cu_seqlens=cu_seqlens, has_init_state=True)
+        q_cula, k_cula = inputs["q"], inputs["k"]          # [B_flat, T, H,  D]
+        q_fla = q_cula.repeat_interleave(HV // H, dim=2).contiguous()  # [B_flat, T, HV, D]
+        k_fla = k_cula.repeat_interleave(HV // H, dim=2).contiguous()
+    else:
+        inputs = prepare_safe_gate_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens, has_init_state=True)
+        q_cula = q_fla = inputs["q"]
+        k_cula = k_fla = inputs["k"]
+    return inputs, q_fla, k_fla, q_cula, k_cula
+
+
+def _compare_accuracy(fla_results, cula_results):
+    """Compare accuracy between FLA and cuLA results, handling GVA dq/dk shape mismatch."""
+    acc = {}
+    for name in ("o", "ht", "dv", "dg", "dbeta", "dh0"):
+        if name in fla_results and name in cula_results:
+            err_ratio, rel_max, mean_diff = accuracy_stats(fla_results[name], cula_results[name])
+            acc[name] = {"err_ratio": err_ratio, "rel_max": rel_max, "mean_diff": mean_diff}
+    if "dq" in fla_results and "dq" in cula_results:
+        dq_fla = fla_results["dq"]
+        dk_fla = fla_results["dk"]
+        if HV > H:
+            # Aggregate FLA HV-space grads back to HQK space for comparison
+            *head_prefix, hv_size, d_size = dq_fla.shape
+            dq_fla = dq_fla.reshape(*head_prefix, H, HV // H, d_size).sum(dim=-2)
+            dk_fla = dk_fla.reshape(*head_prefix, H, HV // H, d_size).sum(dim=-2)
+        for name, ref, out in (("dq", dq_fla, cula_results["dq"]), ("dk", dk_fla, cula_results["dk"])):
+            err_ratio, rel_max, mean_diff = accuracy_stats(ref, out)
+            acc[name] = {"err_ratio": err_ratio, "rel_max": rel_max, "mean_diff": mean_diff}
+    return acc
+
+
 # ============================================================
 # Fixed-length benchmark
 # ============================================================
 def bench_fixed(configs):
+    gva_note = f"GVA HV={HV} ({HV // H}x)" if HV > H else f"MHA HV=H={H}"
     print("\n" + "=" * 120)
-    print(f" Fixed-Length E2E Benchmark: cuLA vs FLA  phase={PHASE}  disable_recompute={DISABLE_RECOMPUTE}")
+    print(f" Fixed-Length E2E Benchmark: cuLA vs FLA  {gva_note}  phase={PHASE}  disable_recompute={DISABLE_RECOMPUTE}")
     print("=" * 120)
     results = []
 
     for B, T in configs:
         set_seed(SEED)
-        device = torch.device("cuda")
         torch.cuda.empty_cache()
 
         seq_lens = [T] * B
-        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
+        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=torch.device("cuda"))
 
-        inputs = prepare_safe_gate_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens, has_init_state=True)
-        q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
+        inputs, q_fla, k_fla, q_cula, k_cula = _prepare_inputs_e2e(B, T, cu_seqlens)
+        v, g, beta = inputs["v"], inputs["g"], inputs["beta"]
         A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
         scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
 
-        # Generate do, dht for backward
         set_seed(SEED + 1)
         do = torch.randn_like(v)
         dht = torch.randn_like(init_state)
 
-        common = dict(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            init_state=init_state,
-            cu_seqlens=cu_seqlens,
-            lower_bound=lower_bound,
-            do=do,
-            dht=dht,
-        )
+        _shared = dict(v=v, g=g, beta=beta, scale=scale, A_log=A_log, dt_bias=dt_bias,
+                       init_state=init_state, cu_seqlens=cu_seqlens, lower_bound=lower_bound,
+                       do=do, dht=dht)
+        common_fla  = dict(q=q_fla,  k=k_fla,  **_shared)
+        common_cula = dict(q=q_cula, k=k_cula, **_shared)
 
-        # Accuracy: compare outputs and gradients
+        # Accuracy
         acc = {}
         if PHASE == "e2e":
-            fla_results = run_kda_e2e_with_grads(**common, fn=fla_chunk_kda)
-            cula_results = run_kda_e2e_with_grads(**common, fn=cula_chunk_kda)
+            fla_results  = run_kda_e2e_with_grads(**common_fla,  fn=fla_chunk_kda)
+            cula_results = run_kda_e2e_with_grads(**common_cula, fn=cula_chunk_kda)
             torch.cuda.synchronize()
-
-            for name in ("o", "ht", "dq", "dk", "dv", "dg", "dbeta", "dh0"):
-                err_ratio, rel_max, mean_diff = accuracy_stats(fla_results[name], cula_results[name])
-                acc[name] = {"err_ratio": err_ratio, "rel_max": rel_max, "mean_diff": mean_diff}
+            acc = _compare_accuracy(fla_results, cula_results)
         else:
-            # forward-only accuracy
-            o_fla, ht_fla = run_kda_e2e(**common, fn=fla_chunk_kda)
-            o_cula, ht_cula = run_kda_e2e(**common, fn=cula_chunk_kda)
+            o_fla,  ht_fla  = run_kda_e2e(**common_fla,  fn=fla_chunk_kda)
+            o_cula, ht_cula = run_kda_e2e(**common_cula, fn=cula_chunk_kda)
             torch.cuda.synchronize()
             for name, ref, out in [("o", o_fla, o_cula), ("ht", ht_fla, ht_cula)]:
                 err_ratio, rel_max, mean_diff = accuracy_stats(ref, out)
                 acc[name] = {"err_ratio": err_ratio, "rel_max": rel_max, "mean_diff": mean_diff}
 
-        # For timing, use leaf tensors with requires_grad
-        q_t = q.detach().clone().requires_grad_(True)
-        k_t = k.detach().clone().requires_grad_(True)
-        v_t = v.detach().clone().requires_grad_(True)
-        g_t = g.detach().clone().requires_grad_(True)
-        beta_t = beta.detach().clone().requires_grad_(True)
-        h0_t = init_state.detach().clone().requires_grad_(True)
+        # Timing: fresh leaf tensors with requires_grad
+        def _make_timing(q_, k_):
+            return dict(
+                q=q_.detach().clone().requires_grad_(True),
+                k=k_.detach().clone().requires_grad_(True),
+                v=v.detach().clone().requires_grad_(True),
+                g=g.detach().clone().requires_grad_(True),
+                beta=beta.detach().clone().requires_grad_(True),
+                scale=scale, A_log=A_log, dt_bias=dt_bias,
+                init_state=init_state.detach().clone().requires_grad_(True),
+                cu_seqlens=cu_seqlens, lower_bound=lower_bound, do=do, dht=dht,
+            )
 
-        timing_common = dict(
-            q=q_t,
-            k=k_t,
-            v=v_t,
-            g=g_t,
-            beta=beta_t,
-            scale=scale,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            init_state=h0_t,
-            cu_seqlens=cu_seqlens,
-            lower_bound=lower_bound,
-            do=do,
-            dht=dht,
-        )
-
-        def fn_fla(**kw):
-            return lambda: run_kda_e2e(**kw, fn=fla_chunk_kda)
-
-        def fn_cula(**kw):
-            return lambda: run_kda_e2e(**kw, fn=cula_chunk_kda)
-
-        ms_fla = time_kernel(fn_fla(**timing_common))
-        ms_cula = time_kernel(fn_cula(**timing_common))
+        ms_fla  = time_kernel(lambda: run_kda_e2e(**_make_timing(q_fla,  k_fla),  fn=fla_chunk_kda))
+        ms_cula = time_kernel(lambda: run_kda_e2e(**_make_timing(q_cula, k_cula), fn=cula_chunk_kda))
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
-        r = {
-            "B": B,
-            "T": T,
-            "accuracy": acc,
-            "ms_fla": ms_fla,
-            "ms_cula": ms_cula,
-            "speedup": speedup,
-        }
-        results.append(r)
+        results.append({
+            "B": B, "T": T, "H": H, "HV": HV,
+            "accuracy": acc, "ms_fla": ms_fla, "ms_cula": ms_cula, "speedup": speedup,
+        })
 
-        del q, k, v, g, beta, A_log, dt_bias, inputs, do, dht
+        del inputs, do, dht
         torch.cuda.empty_cache()
 
     return results
@@ -342,115 +354,76 @@ def bench_fixed(configs):
 # Varlen benchmark
 # ============================================================
 def bench_varlen(configs):
+    gva_note = f"GVA HV={HV} ({HV // H}x)" if HV > H else f"MHA HV=H={H}"
     print("\n" + "=" * 120)
-    print(f" Varlen E2E Benchmark: cuLA vs FLA  phase={PHASE}  disable_recompute={DISABLE_RECOMPUTE}")
+    print(f" Varlen E2E Benchmark: cuLA vs FLA  {gva_note}  phase={PHASE}  disable_recompute={DISABLE_RECOMPUTE}")
     print("=" * 120)
     results = []
 
     for seq_lens, total_len, dist in configs:
         set_seed(SEED)
-        device = torch.device("cuda")
         torch.cuda.empty_cache()
 
         T = total_len
-        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
+        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=torch.device("cuda"))
 
-        inputs = prepare_safe_gate_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens, has_init_state=True)
-        q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
+        inputs, q_fla, k_fla, q_cula, k_cula = _prepare_inputs_e2e(1, T, cu_seqlens)
+        v, g, beta = inputs["v"], inputs["g"], inputs["beta"]
         A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
         scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
 
-        # Generate do, dht for backward
         set_seed(SEED + 1)
         do = torch.randn_like(v)
         dht = torch.randn_like(init_state)
 
-        common = dict(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            init_state=init_state,
-            cu_seqlens=cu_seqlens,
-            lower_bound=lower_bound,
-            do=do,
-            dht=dht,
-        )
+        _shared = dict(v=v, g=g, beta=beta, scale=scale, A_log=A_log, dt_bias=dt_bias,
+                       init_state=init_state, cu_seqlens=cu_seqlens, lower_bound=lower_bound,
+                       do=do, dht=dht)
+        common_fla  = dict(q=q_fla,  k=k_fla,  **_shared)
+        common_cula = dict(q=q_cula, k=k_cula, **_shared)
 
-        # Accuracy: compare outputs and gradients
+        # Accuracy
         acc = {}
         if PHASE == "e2e":
-            fla_results = run_kda_e2e_with_grads(**common, fn=fla_chunk_kda)
-            cula_results = run_kda_e2e_with_grads(**common, fn=cula_chunk_kda)
+            fla_results  = run_kda_e2e_with_grads(**common_fla,  fn=fla_chunk_kda)
+            cula_results = run_kda_e2e_with_grads(**common_cula, fn=cula_chunk_kda)
             torch.cuda.synchronize()
-
-            for name in ("o", "ht", "dq", "dk", "dv", "dg", "dbeta", "dh0"):
-                err_ratio, rel_max, mean_diff = accuracy_stats(fla_results[name], cula_results[name])
-                acc[name] = {"err_ratio": err_ratio, "rel_max": rel_max, "mean_diff": mean_diff}
+            acc = _compare_accuracy(fla_results, cula_results)
         else:
-            o_fla, ht_fla = run_kda_e2e(**common, fn=fla_chunk_kda)
-            o_cula, ht_cula = run_kda_e2e(**common, fn=cula_chunk_kda)
+            o_fla,  ht_fla  = run_kda_e2e(**common_fla,  fn=fla_chunk_kda)
+            o_cula, ht_cula = run_kda_e2e(**common_cula, fn=cula_chunk_kda)
             torch.cuda.synchronize()
             for name, ref, out in [("o", o_fla, o_cula), ("ht", ht_fla, ht_cula)]:
                 err_ratio, rel_max, mean_diff = accuracy_stats(ref, out)
                 acc[name] = {"err_ratio": err_ratio, "rel_max": rel_max, "mean_diff": mean_diff}
 
-        # For timing, use leaf tensors with requires_grad
-        q_t = q.detach().clone().requires_grad_(True)
-        k_t = k.detach().clone().requires_grad_(True)
-        v_t = v.detach().clone().requires_grad_(True)
-        g_t = g.detach().clone().requires_grad_(True)
-        beta_t = beta.detach().clone().requires_grad_(True)
-        h0_t = init_state.detach().clone().requires_grad_(True)
+        # Timing: fresh leaf tensors with requires_grad
+        def _make_timing(q_, k_):
+            return dict(
+                q=q_.detach().clone().requires_grad_(True),
+                k=k_.detach().clone().requires_grad_(True),
+                v=v.detach().clone().requires_grad_(True),
+                g=g.detach().clone().requires_grad_(True),
+                beta=beta.detach().clone().requires_grad_(True),
+                scale=scale, A_log=A_log, dt_bias=dt_bias,
+                init_state=init_state.detach().clone().requires_grad_(True),
+                cu_seqlens=cu_seqlens, lower_bound=lower_bound, do=do, dht=dht,
+            )
 
-        timing_common = dict(
-            q=q_t,
-            k=k_t,
-            v=v_t,
-            g=g_t,
-            beta=beta_t,
-            scale=scale,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            init_state=h0_t,
-            cu_seqlens=cu_seqlens,
-            lower_bound=lower_bound,
-            do=do,
-            dht=dht,
-        )
-
-        def fn_fla(**kw):
-            return lambda: run_kda_e2e(**kw, fn=fla_chunk_kda)
-
-        def fn_cula(**kw):
-            return lambda: run_kda_e2e(**kw, fn=cula_chunk_kda)
-
-        ms_fla = time_kernel(fn_fla(**timing_common))
-        ms_cula = time_kernel(fn_cula(**timing_common))
+        ms_fla  = time_kernel(lambda: run_kda_e2e(**_make_timing(q_fla,  k_fla),  fn=fla_chunk_kda))
+        ms_cula = time_kernel(lambda: run_kda_e2e(**_make_timing(q_cula, k_cula), fn=cula_chunk_kda))
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         n_seqs = len(seq_lens)
-        min_l, max_l = min(seq_lens), max(seq_lens)
-        avg_l = T // n_seqs
-        tag = f"{dist:>7s} {n_seqs:>2d}seqs T={T} [{min_l}..{max_l}] avg={avg_l}"
+        tag = f"{dist:>7s} {n_seqs:>2d}seqs T={T} [{min(seq_lens)}..{max(seq_lens)}] avg={T // n_seqs}"
 
-        r = {
-            "tag": tag,
-            "dist": dist,
-            "T_total": T,
-            "n_seqs": n_seqs,
-            "accuracy": acc,
-            "ms_fla": ms_fla,
-            "ms_cula": ms_cula,
-            "speedup": speedup,
-        }
-        results.append(r)
+        results.append({
+            "tag": tag, "dist": dist, "T_total": T, "n_seqs": n_seqs,
+            "H": H, "HV": HV,
+            "accuracy": acc, "ms_fla": ms_fla, "ms_cula": ms_cula, "speedup": speedup,
+        })
 
-        del q, k, v, g, beta, A_log, dt_bias, inputs, do, dht
+        del inputs, do, dht
         torch.cuda.empty_cache()
 
     return results
@@ -465,15 +438,17 @@ def print_report(fixed_results, varlen_results):
     print("                       BENCHMARK REPORT: chunk_kda forward+backward (E2E)")
     print("                       cuLA CuTe DSL vs FLA Triton")
     print(
-        f"                       H={H}  D={D}  dtype=bf16  safe_gate=True  phase={PHASE}  disable_recompute={DISABLE_RECOMPUTE}"
+        f"                       D={D}  dtype=bf16  safe_gate=True  phase={PHASE}  disable_recompute={DISABLE_RECOMPUTE}"
     )
+    gva_note = f"GVA enabled (HV={HV} > H={H}, ratio={HV // H}x)" if HV > H else f"MHA (HV=H={H})"
+    print(f"                       {gva_note}")
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
     mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
     print(f"                       Warmup={wu}  Iters={ni}{mode_tag}")
     print(sep)
 
-    # Determine which accuracy keys to show
+    # Determine which accuracy keys to show (dq/dk present in e2e mode)
     if PHASE == "e2e":
         acc_keys = ["o", "ht", "dq", "dk", "dv", "dg", "dbeta", "dh0"]
     else:
@@ -483,44 +458,39 @@ def print_report(fixed_results, varlen_results):
 
     if fixed_results:
         print("\n  [Fixed-Length]")
-        print(f"  {'─' * 125}")
-
-        # Header
-        print(f"  {'B':>3s}  {'T':>5s}  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>11s}  {'Speedup':>8s}  │  {'':>10s}{acc_header}")
-        print(f"  {'─' * 125}")
-
+        print(f"  {'─' * 130}")
+        print(f"  {'B':>3s}  {'T':>6s}  {'H':>3s}  {'HV':>3s}  {'GVA':>4s}  │  "
+              f"{'FLA(ms)':>9s}  {'cuLA(ms)':>11s}  {'Speedup':>8s}  │  {'':>10s}{acc_header}")
+        print(f"  {'─' * 130}")
         for r in fixed_results:
-            rel_max_vals = "  ".join(f"{r['accuracy'].get(k, {}).get('rel_max', 0.0):10.6f}" for k in acc_keys)
+            gva_tag = f"{r['HV'] // r['H']}x" if r["HV"] > r["H"] else "no"
+            rel_max_vals   = "  ".join(f"{r['accuracy'].get(k, {}).get('rel_max',   0.0):10.6f}" for k in acc_keys)
             err_ratio_vals = "  ".join(f"{r['accuracy'].get(k, {}).get('err_ratio', 0.0):10.6f}" for k in acc_keys)
-            # Line 1: timing + rel_max
-            print(
-                f"  {r['B']:3d}  {r['T']:5d}  │  "
-                f"{r['ms_fla']:9.4f}  {r['ms_cula']:11.4f}  {r['speedup']:7.2f}x  │  "
-                f"{'rel_max:':>10s}{rel_max_vals}"
-            )
-            # Line 2: err_ratio (no timing columns)
-            print(f"  {'':3s}  {'':5s}  │  {'':9s}  {'':11s}  {'':8s}  │  {'err_ratio:':>10s}{err_ratio_vals}")
-        print(f"  {'─' * 125}")
+            prefix = f"  {r['B']:3d}  {r['T']:6d}  {r['H']:3d}  {r['HV']:3d}  {gva_tag:>4s}  │  "
+            blank  = f"  {'':3s}  {'':6s}  {'':3s}  {'':3s}  {'':4s}  │  "
+            timing = f"{r['ms_fla']:9.4f}  {r['ms_cula']:11.4f}  {r['speedup']:7.2f}x  │  "
+            blank_t = f"{'':9s}  {'':11s}  {'':8s}  │  "
+            print(f"{prefix}{timing}{'rel_max:':>10s}{rel_max_vals}")
+            print(f"{blank}{blank_t}{'err_ratio:':>10s}{err_ratio_vals}")
+        print(f"  {'─' * 130}")
 
     if varlen_results:
         print("\n  [Varlen]")
-        print(f"  {'─' * 140}")
-
-        print(f"  {'Config':>45s}  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>11s}  {'Speedup':>8s}  │  {'':>10s}{acc_header}")
-        print(f"  {'─' * 140}")
-
+        print(f"  {'─' * 145}")
+        print(f"  {'Config':>45s}  {'H':>3s}  {'HV':>3s}  {'GVA':>4s}  │  "
+              f"{'FLA(ms)':>9s}  {'cuLA(ms)':>11s}  {'Speedup':>8s}  │  {'':>10s}{acc_header}")
+        print(f"  {'─' * 145}")
         for r in varlen_results:
-            rel_max_vals = "  ".join(f"{r['accuracy'].get(k, {}).get('rel_max', 0.0):10.6f}" for k in acc_keys)
+            gva_tag = f"{r['HV'] // r['H']}x" if r["HV"] > r["H"] else "no"
+            rel_max_vals   = "  ".join(f"{r['accuracy'].get(k, {}).get('rel_max',   0.0):10.6f}" for k in acc_keys)
             err_ratio_vals = "  ".join(f"{r['accuracy'].get(k, {}).get('err_ratio', 0.0):10.6f}" for k in acc_keys)
-            # Line 1: timing + rel_max
-            print(
-                f"  {r['tag']:>45s}  │  "
-                f"{r['ms_fla']:9.4f}  {r['ms_cula']:11.4f}  {r['speedup']:7.2f}x  │  "
-                f"{'rel_max:':>10s}{rel_max_vals}"
-            )
-            # Line 2: err_ratio (no config/timing columns)
-            print(f"  {'':>45s}  │  {'':9s}  {'':11s}  {'':8s}  │  {'err_ratio:':>10s}{err_ratio_vals}")
-        print(f"  {'─' * 140}")
+            prefix = f"  {r['tag']:>45s}  {r['H']:3d}  {r['HV']:3d}  {gva_tag:>4s}  │  "
+            blank  = f"  {'':>45s}  {'':3s}  {'':3s}  {'':4s}  │  "
+            timing = f"{r['ms_fla']:9.4f}  {r['ms_cula']:11.4f}  {r['speedup']:7.2f}x  │  "
+            blank_t = f"{'':9s}  {'':11s}  {'':8s}  │  "
+            print(f"{prefix}{timing}{'rel_max:':>10s}{rel_max_vals}")
+            print(f"{blank}{blank_t}{'err_ratio:':>10s}{err_ratio_vals}")
+        print(f"  {'─' * 145}")
 
     print(f"\n{sep}\n")
 
@@ -564,9 +534,15 @@ def main():
         action="store_true",
         help="Run determinism check: verify cuLA produces identical outputs across repeated runs",
     )
+    parser.add_argument(
+        "--hv",
+        type=int,
+        default=None,
+        help=f"Override number of V heads (HV). Default: H ({H}, no GVA). Set HV > H for GVA mode.",
+    )
     args = parser.parse_args()
 
-    global NCU_MODE, SANITIZER_MODE, DISABLE_RECOMPUTE, PHASE
+    global NCU_MODE, SANITIZER_MODE, DISABLE_RECOMPUTE, PHASE, HV
     if args.ncu:
         NCU_MODE = True
         print("[NCU mode] warmup=1, iters=1")
@@ -577,6 +553,12 @@ def main():
         DISABLE_RECOMPUTE = True
         print("[Disable recompute] pre-compute QG in forward")
     PHASE = args.phase
+    if args.hv is not None:
+        if args.hv < H or args.hv % H != 0:
+            raise ValueError(f"--hv must be a positive multiple of H ({H}), got {args.hv}")
+        HV = args.hv
+        if HV > H:
+            print(f"[GVA] HV={HV} (H={H}, ratio={HV // H}x)")
 
     if args.check_determinism:
         det_configs = [(5, 1024), (10, 4096), (10, 8192), (10, 16384)]
@@ -616,6 +598,7 @@ def main():
         varlen_res = bench_varlen(varlen_configs)
 
     print_report(fixed_res, varlen_res)
+
     return fixed_res, varlen_res
 
 

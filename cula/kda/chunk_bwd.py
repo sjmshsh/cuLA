@@ -61,8 +61,6 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_kda_bwd_kernel_dAv(
-    q,
-    k,
     v,
     A,
     do,
@@ -80,6 +78,7 @@ def chunk_kda_bwd_kernel_dAv(
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    # H here is HV (v-head count). q/k are not needed for this computation.
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
@@ -90,8 +89,6 @@ def chunk_kda_bwd_kernel_dAv(
         bos, eos = i_b * T, i_b * T + T
 
     # offset calculation
-    q += (bos * H + i_h) * K
-    k += (bos * H + i_h) * K
     v += (bos * H + i_h) * V
     do += (bos * H + i_h) * V
     dv += (bos * H + i_h) * V
@@ -165,6 +162,7 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
     scale,
     T,
     H: tl.constexpr,
+    HQK: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -173,8 +171,12 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
     TRANSPOSE_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    # H  = HV (v-head count); grid enumerates B * HV tile-pairs.
+    # HQK = qk-head count (HQK <= H; when HQK == H this is standard non-GVA).
+    # For each v-head i_h, the paired qk-head is i_hqk = i_h // (H // HQK).
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
+    i_hqk = i_h // (H // HQK)
 
     if IS_VARLEN:
         i_tg = i_t.to(tl.int64)
@@ -191,8 +193,9 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
     m_t = o_t < T
     m_last = o_t == min(T, i_t * BT + BT) - 1
 
-    q += (bos * H + i_h) * K
-    k += (bos * H + i_h) * K
+    # q/k/dq/dk use qk-head stride (HQK); all others use v-head stride (H = HV).
+    q += (bos * HQK + i_hqk) * K
+    k += (bos * HQK + i_hqk) * K
     v += (bos * H + i_h) * V
     v_new += (bos * H + i_h) * V
     g += (bos * H + i_h) * K
@@ -201,8 +204,8 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
     h += (i_tg * H + i_h) * K * V
     do += (bos * H + i_h) * V
     dh += (i_tg * H + i_h) * K * V
-    dq += (bos * H + i_h) * K
-    dk += (bos * H + i_h) * K
+    dq += (bos * HQK + i_hqk) * K
+    dk += (bos * HQK + i_hqk) * K
     dv += (bos * H + i_h) * V
     dv2 += (bos * H + i_h) * V
     dg += (bos * H + i_h) * K
@@ -212,7 +215,7 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
     p_beta = tl.make_block_ptr(beta, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_beta = tl.load(p_beta, boundary_check=(0,))
 
-    p_A = tl.make_block_ptr(A, (BT, T), (1, H * BT), (0, i_t * BT), (BT, BT), (0, 1))
+    p_A = tl.make_block_ptr(A, (BT, T), (1, H * BT), (0, i_t * BT), (BT, BT), (0, 1))  # H = HV
     b_A = tl.load(p_A, boundary_check=(0, 1))
 
     b_dA = tl.zeros([BT, BT], dtype=tl.float32)
@@ -222,7 +225,7 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
         o_k = i_k * BK + tl.arange(0, BK)
         m_k = o_k < K
 
-        p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_k = tl.make_block_ptr(k, (T, K), (HQK * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         p_g = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
@@ -287,15 +290,15 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
         b_dkgb = tl.dot(b_A, b_dw)
         b_db += tl.sum(b_dkgb * b_kg, 1)
 
-        p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_q = tl.make_block_ptr(q, (T, K), (HQK * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_q = tl.load(p_q, boundary_check=(0, 1))
         b_kdk = b_k * b_dk
         b_dgk += tl.sum(b_kdk, axis=0)
         b_dg = b_q * b_dq - b_kdk + m_last[:, None] * b_dgk + b_kg * b_dkgb * b_beta[:, None]
         b_dk = b_dk + b_dkgb * b_gb
 
-        p_dq = tl.make_block_ptr(dq, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_dk = tl.make_block_ptr(dk, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_dq = tl.make_block_ptr(dq, (T, K), (HQK * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_dk = tl.make_block_ptr(dk, (T, K), (HQK * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         p_dg = tl.make_block_ptr(dg, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
         tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
@@ -307,8 +310,8 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
     b_dA = tl.dot(b_A, b_dA.to(b_A.dtype))
     b_dA = tl.where(m_A, -b_dA, 0)
 
-    p_dA = tl.make_block_ptr(dA, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    p_db = tl.make_block_ptr(db, (T,), (H,), (i_t * BT,), (BT,), (0,))
+    p_dA = tl.make_block_ptr(dA, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))  # H = HV
+    p_db = tl.make_block_ptr(db, (T,), (H,), (i_t * BT,), (BT,), (0,))  # H = HV
     tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_db, b_db.to(p_db.dtype.element_ty), boundary_check=(0,))
 
@@ -324,7 +327,10 @@ def chunk_kda_bwd_dAv(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    B, T, H, K, V = *k.shape, do.shape[-1]
+    # q/k are accepted for API compatibility but not forwarded to the kernel
+    # (they are unused in the dAv computation).
+    B, T, HV, V = v.shape[0], v.shape[1], v.shape[2], v.shape[3]
+    K = k.shape[-1]
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
@@ -339,12 +345,11 @@ def chunk_kda_bwd_dAv(
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    dA = v.new_empty(B, T, H, BT, dtype=torch.float)
+    # dA and dv live in v-head space (HV), matching Aqk/v_new/do shapes.
+    dA = v.new_empty(B, T, HV, BT, dtype=torch.float)
     dv = torch.empty_like(do)
-    grid = (NT, B * H)
+    grid = (NT, B * HV)
     chunk_kda_bwd_kernel_dAv[grid](
-        q=q,
-        k=k,
         v=v,
         A=A,
         do=do,
@@ -354,7 +359,7 @@ def chunk_kda_bwd_dAv(
         chunk_indices=chunk_indices,
         scale=scale,
         T=T,
-        H=H,
+        H=HV,
         K=K,
         V=V,
         BT=BT,
@@ -382,13 +387,16 @@ def chunk_kda_bwd_wy_dqkg_fused(
     chunk_indices: torch.LongTensor | None = None,
     transpose_state_layout: bool = False,
 ):
-    B, T, H, K, V = *k.shape, v.shape[-1]
+    B, T, HQK, K = k.shape
+    HV = v.shape[2]
+    V = v.shape[-1]
     BT = chunk_size
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
+    # dq/dk live in qk-head space (HQK); dv/dg/db/dA in v-head space (HV).
     dq = torch.empty_like(q, dtype=torch.float)
     dk = torch.empty_like(k, dtype=torch.float)
     dv2 = torch.empty_like(v)
@@ -396,7 +404,7 @@ def chunk_kda_bwd_wy_dqkg_fused(
     db = torch.empty_like(beta, dtype=torch.float)
     dA = torch.empty_like(A, dtype=torch.float)
 
-    grid = (NT, B * H)
+    grid = (NT, B * HV)
     chunk_kda_bwd_kernel_wy_dqkg_fused[grid](
         q=q,
         k=k,
@@ -419,7 +427,8 @@ def chunk_kda_bwd_wy_dqkg_fused(
         chunk_indices=chunk_indices,
         scale=scale,
         T=T,
-        H=H,
+        H=HV,
+        HQK=HQK,
         K=K,
         V=V,
         BT=BT,
@@ -457,7 +466,8 @@ def chunk_kda_bwd(
 ):
     assert transpose_state_layout is False, "transpose_state_layout=True is not supported for training."
     if disable_recompute is False:
-        B, T, _, _ = k.shape
+        B, T, HQK, K_dim = k.shape
+        HV = v.shape[2]
         if use_gate_in_kernel:
             g = kda_gate_chunk_cumsum(
                 g=g_org,
@@ -475,10 +485,11 @@ def chunk_kda_bwd(
             cu_seqlens = prepare_uniform_cu_seqlens(B, T, q.device, torch.int32)
         if chunk_indices is None and cu_seqlens is not None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-        w = torch.empty_like(k)
+        # In GVA mode, w/u/qg/kg live in v-head space (HV), not qk-head space (HQK).
+        w = torch.empty(B, T, HV, K_dim, device=k.device, dtype=k.dtype)
         u = torch.empty_like(v)
-        qg = torch.empty_like(q) if q is not None else None
-        kg = torch.empty_like(k) if g is not None else None
+        qg = torch.empty(B, T, HV, K_dim, device=q.device, dtype=q.dtype) if q is not None else None
+        kg = torch.empty(B, T, HV, K_dim, device=k.device, dtype=k.dtype) if g is not None else None
         cula_cuda.recompute_w_u_cuda(k, v, beta, Akk, g, cu_seqlens, chunk_indices, w, u, kg, chunk_size, q, qg)
         if cp_context is not None:
             # Restore the full initial_state tensor from the compressed version.
