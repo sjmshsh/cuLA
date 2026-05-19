@@ -134,9 +134,6 @@ class KDAChunkwise:
         num_regs_cuda: int = 224,
         num_regs_subchunk: int = 192,
         num_regs_others: int = 64,  # Optimized: best config from comprehensive sweep
-        # GVA: ratio of v-heads to qk-heads.  1 = standard MHA.
-        # P1 will thread this through the kernel tile scheduler and memory layouts.
-        heads_per_group: int = 1,
     ):
         assert_blackwell()
         # make scale a constant
@@ -146,7 +143,6 @@ class KDAChunkwise:
         self.output_final_state = output_final_state
         self.is_varlen = is_varlen
         self.use_fast_math = use_fast_math
-        self.heads_per_group = heads_per_group
 
         self.chunk_size = chunk_size
         self.subchunk_size = 16
