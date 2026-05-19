@@ -68,11 +68,22 @@ class ChunkKDAFunction(torch.autograd.Function):
         chunk_indices: torch.IntTensor | None = None,
     ):
         chunk_size = 64
-        assert q.shape[-2] == v.shape[-2] == k.shape[-2], "Number of heads must be the same for q, k, v."
+
+        # GVA: q/k are in HQK head space; v/g/beta/o/state are in HV head space.
+        # HV must be a positive multiple of HQK.  When HV == HQK this is standard MHA.
+        assert q.shape == k.shape, "q and k must have the same shape."
+        assert q.shape[:2] == v.shape[:2] == g.shape[:2], "q, k, v, g must share (B, T) dimensions."
+        B, S, HQK, D = q.shape
+        HV = v.shape[2]
+        assert HQK > 0 and HV > 0 and HV % HQK == 0, (
+            f"v/g head count (HV={HV}) must be a positive multiple of q/k head count (HQK={HQK})."
+        )
+        assert g.shape == (B, S, HV, D), f"g must be [B,S,HV,D]=({B},{S},{HV},{D}), got {tuple(g.shape)}."
+        assert beta.shape[:3] == (B, S, HV), f"beta must have shape [B,S,HV,...], got {tuple(beta.shape)}."
+        heads_per_group = HV // HQK
 
         global compiled_kernel_cache
 
-        B, S, H, D = q.shape
         is_varlen = cu_seqlens is not None
         if is_varlen:
             assert B == 1, "For varlen, batch size must be 1. Flatten variable-length inputs first."
@@ -120,20 +131,29 @@ class ChunkKDAFunction(torch.autograd.Function):
             q, q_rstd = l2norm_fwd(q)
             k, k_rstd = l2norm_fwd(k)
 
+        # GVA compat: the WIP CuTe kernel currently assumes a single head count for
+        # all operands.  Until P1 (native GVA in the kernel), expand q/k from HQK to
+        # HV heads so the kernel sees consistent head dimensions everywhere.
+        # P1 will remove this expansion and thread HQK/HV through the kernel directly.
+        if heads_per_group > 1:
+            q = q.repeat_interleave(heads_per_group, dim=2).contiguous()
+            k = k.repeat_interleave(heads_per_group, dim=2).contiguous()
+
         q_cute = from_dlpack(q.detach())
         k_cute = from_dlpack(k.detach())
         v_cute = from_dlpack(v.detach())
         g_cute = from_dlpack(g.detach())
         beta_cute = from_dlpack(beta.detach())
 
-        # FIXME: support return final_states
-        o = torch.empty_like(q)
+        # Output lives in HV head space (same as v).
+        o = torch.empty_like(v)
         o_cute = from_dlpack(o.detach())
 
         stream = cutlass_torch.default_stream()
 
         has_initial_state = initial_state is not None
-        cache_key = (has_initial_state, output_final_state, safe_gate, is_varlen, scale, chunk_size, D, USE_FAST_MATH)
+        # Include HQK and HV so that MHA and GVA compilations are cached separately.
+        cache_key = (has_initial_state, output_final_state, safe_gate, is_varlen, scale, chunk_size, HQK, HV, D, USE_FAST_MATH)
 
         # Prepare cu_seqlens as int32 for kernel
         if is_varlen:
@@ -184,7 +204,7 @@ class ChunkKDAFunction(torch.autograd.Function):
                 dc["workspace_cute"] = from_dlpack(ws_buf.detach())
             workspace_cute = dc["workspace_cute"]
 
-        # State shape: [num_seqs, H, D, D]
+        # State shape: [num_seqs, HV, D, D]  — state is per v-head under GVA.
         # Prepare initial_state and final_state tensors
         if has_initial_state:
             initial_state_f32 = initial_state.to(torch.float32).contiguous()
@@ -195,15 +215,18 @@ class ChunkKDAFunction(torch.autograd.Function):
             initial_state_cute = _dummy_cache[q.device]["state_cute"]
 
         if output_final_state:
-            final_state_f32 = torch.zeros(num_seqs, H, D, D, dtype=torch.float32, device=q.device)
+            final_state_f32 = torch.zeros(num_seqs, HV, D, D, dtype=torch.float32, device=q.device)
             final_state_cute = from_dlpack(final_state_f32.detach())
         else:
             # Use cached tiny dummy (pointer won't be dereferenced when output_final_state=False)
             final_state_f32 = None
             final_state_cute = _dummy_cache[q.device]["state_cute"]
 
-        # problem_size: (num_seqs, total_tokens_or_seq_len, H, D)
-        problem_size = (num_seqs, S, H, D)
+        # problem_size: (num_seqs, total_tokens_or_seq_len, HV, D)
+        # After the q/k expand above, all operands share HV as the head count, so the
+        # WIP kernel receives a consistent single head dimension.
+        # P1 will change this to pass (num_seqs, S, HQK, HV, D) for native GVA.
+        problem_size = (num_seqs, S, HV, D)
 
         if cache_key in compiled_kernel_cache:
             compiled_kernel = compiled_kernel_cache[cache_key]
@@ -219,6 +242,10 @@ class ChunkKDAFunction(torch.autograd.Function):
                 output_final_state=output_final_state,
                 is_varlen=is_varlen,
                 use_fast_math=USE_FAST_MATH,
+                # heads_per_group is stored for future P1 native-GVA kernel support.
+                # The current WIP kernel receives expanded q/k so heads_per_group == 1
+                # from its perspective; this field is a no-op until P1.
+                heads_per_group=heads_per_group,
             )
             compiled_kernel = cute.compile(
                 attn_kernel,
@@ -292,24 +319,24 @@ def flash_kda_prefill(
     r"""
     Args:
         q (torch.Tensor):
-            queries of shape `[B, T, H, K]`.
+            queries of shape `[B, T, HQK, K]`.
         k (torch.Tensor):
-            keys of shape `[B, T, H, K]`.
+            keys of shape `[B, T, HQK, K]`.
         v (torch.Tensor):
-            values of shape `[B, T, H, V]`.
+            values of shape `[B, T, HV, V]` where ``HV`` is a positive multiple of ``HQK``.
         g (torch.Tensor):
-            (forget) gating tensor (in log space!) of shape `[B, T, H, K]`.
+            (forget) gating tensor (in log space!) of shape `[B, T, HV, K]`.
         beta (torch.Tensor):
-            betas of shape `[B, T, H]`.
+            betas of shape `[B, T, HV]`.
         scale (Optional[float]):
             Scale factor for the KDA attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[N, H, K, V]` for `N` input sequences.
+            Initial state of shape `[N, HV, K, V]` for `N` input sequences.
             For equal-length input sequences, `N` equals the batch size `B`.
             Default: `None`.
         output_final_state (Optional[bool]):
-            Whether to output the final state of shape `[N, H, K, V]`. Default: `False`.
+            Whether to output the final state of shape `[N, HV, K, V]`. Default: `False`.
         use_qk_l2norm_in_kernel (bool):
             Whether to apply L2norm to the q,k tensor internally. Default: `False`.
         use_gate_in_kernel (bool):
@@ -336,9 +363,9 @@ def flash_kda_prefill(
 
     Returns:
         o (torch.Tensor):
-            Outputs of shape `[B, T, H, V]`.
+            Outputs of shape `[B, T, HV, V]`.
         final_state (torch.Tensor):
-            Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
+            Final state of shape `[N, HV, K, V]` if `output_final_state=True` else `None`.
     """
     assert_blackwell()
     # initial_state is now supported
@@ -369,9 +396,20 @@ def flash_kda_prefill(
             if not (-5 <= lower_bound < 0):
                 raise ValueError(f"`lower_bound` must be in the safe range [-5, 0), got {lower_bound}.")
 
-    assert q.shape == k.shape == g.shape, "q, k, g must have the same shape."
-    assert beta.shape == q.shape[:3], "beta must be of shape (batch size, seq len, num of head)."
-    assert v.shape == (*q.shape[:3], v.shape[-1]), "v must be of shape (batch size, seq len, num of head, head dim)."
+    # GVA shape validation — mirrors chunk.py / hopper_fused_fwd.py.
+    B_outer, T_outer, HQK_outer, D_outer = q.shape
+    HV_outer = v.shape[2]
+    assert q.shape == k.shape, "q and k must have the same shape."
+    assert q.shape[:2] == v.shape[:2] == g.shape[:2], "q, k, v, g must share (B, T) dimensions."
+    assert HQK_outer > 0 and HV_outer > 0 and HV_outer % HQK_outer == 0, (
+        f"v/g head count (HV={HV_outer}) must be a positive multiple of q/k head count (HQK={HQK_outer})."
+    )
+    assert g.shape == (B_outer, T_outer, HV_outer, D_outer), (
+        f"g must be [B,T,HV,D]=({B_outer},{T_outer},{HV_outer},{D_outer}), got {tuple(g.shape)}."
+    )
+    assert beta.shape[:3] == (B_outer, T_outer, HV_outer), (
+        f"beta must have shape [B,T,HV,...], got {tuple(beta.shape)}."
+    )
     assert q.dtype == k.dtype == v.dtype == torch.bfloat16, "q, k, v must be in bfloat16."
     assert q.shape[-1] == k.shape[-1] == v.shape[-1] == 128, "Currently we only support head dim of 128 for KDA"
     if scale is None:
