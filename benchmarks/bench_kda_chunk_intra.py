@@ -20,7 +20,7 @@ In GVA mode the FLA reference replicates q/k to HV heads; cuLA operates natively
 with compact q/k in HQK space.
 
 Usage:
-  python bench_kda_chunk_intra.py [--heads H] [--hv HV] [--disable_recompute]
+  python bench_kda_chunk_intra.py [--hv HV] [--disable_recompute]
 """
 
 import argparse
@@ -203,12 +203,6 @@ if __name__ == "__main__":
         help="Disable recompute in both FLA and cuLA (pre-compute QG)",
     )
     parser.add_argument(
-        "--heads",
-        type=int,
-        default=None,
-        help=f"Override number of QK heads (H). Default: {H}.",
-    )
-    parser.add_argument(
         "--hv",
         type=int,
         default=None,
@@ -219,10 +213,6 @@ if __name__ == "__main__":
     if args.disable_recompute:
         DISABLE_RECOMPUTE = True
         print("[Disable recompute] pre-compute QG in forward")
-
-    if args.heads is not None:
-        H = args.heads
-        HV = H  # reset HV to new H unless --hv is also provided
 
     if args.hv is not None:
         if args.hv < H or args.hv % H != 0:
