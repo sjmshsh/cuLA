@@ -36,7 +36,7 @@ os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1")) 
 
 from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_intra
 
-from benchmarks.utils import SEED, exclusive_cumsum, generate_random_seq_lens, prepare_intra_inputs, prepare_intra_inputs_gva
+from benchmarks.utils import SEED, exclusive_cumsum, generate_random_seq_lens, prepare_intra_inputs
 from cula.kda.chunk_intra import chunk_kda_fwd_intra as cula_chunk_kda_fwd_intra
 
 # Constant params
@@ -92,17 +92,12 @@ def benchmark_chunk_intra_uniform():
         seq_lens = [T] * B
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-        if gva_mode:
-            q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs_gva(
-                B, T, HQK, HV, D, device, cu_seqlens=cu_seqlens
-            )
-            k_ref = k.repeat_interleave(group_size, dim=2).contiguous()
-            q_ref = q.repeat_interleave(group_size, dim=2).contiguous()
-        else:
-            q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(
-                B, T, H, D, device, cu_seqlens=cu_seqlens
-            )
-            q_ref, k_ref = q, k
+        q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(
+            B, T, HQK, D, device, cu_seqlens=cu_seqlens, num_v_heads=HV
+        )
+        # FLA reference: replicate q/k to HV heads when in GVA mode
+        q_ref = q.repeat_interleave(group_size, dim=2).contiguous() if gva_mode else q
+        k_ref = k.repeat_interleave(group_size, dim=2).contiguous() if gva_mode else k
 
         common_fla = dict(
             q=q_ref, k=k_ref, v=v, gk=g, beta=beta, scale=scale,
@@ -163,17 +158,12 @@ def benchmark_chunk_intra_varlen():
         T = total_len
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-        if gva_mode:
-            q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs_gva(
-                1, T, HQK, HV, D, device, cu_seqlens=cu_seqlens
-            )
-            k_ref = k.repeat_interleave(group_size, dim=2).contiguous()
-            q_ref = q.repeat_interleave(group_size, dim=2).contiguous()
-        else:
-            q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(
-                1, T, H, D, device, cu_seqlens=cu_seqlens
-            )
-            q_ref, k_ref = q, k
+        q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(
+            1, T, HQK, D, device, cu_seqlens=cu_seqlens, num_v_heads=HV
+        )
+        # FLA reference: replicate q/k to HV heads when in GVA mode
+        q_ref = q.repeat_interleave(group_size, dim=2).contiguous() if gva_mode else q
+        k_ref = k.repeat_interleave(group_size, dim=2).contiguous() if gva_mode else k
 
         common_fla = dict(
             q=q_ref, k=k_ref, v=v, gk=g, beta=beta, scale=scale,

@@ -27,7 +27,7 @@ from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_int
 from fla.ops.kda.wy_fast import recompute_w_u_fwd as fla_recompute_w_u_fwd
 
 import cula.cudac as cula_cuda
-from benchmarks.utils import SEED, exclusive_cumsum, generate_random_seq_lens, prepare_intra_inputs, prepare_intra_inputs_gva
+from benchmarks.utils import SEED, exclusive_cumsum, generate_random_seq_lens, prepare_intra_inputs
 from cula.kda.chunk_intra import chunk_kda_fwd_intra as cula_chunk_kda_fwd_intra
 
 # Constant params
@@ -122,8 +122,8 @@ def prepare_recompute_wu_inputs_gva(B, T, HQK, HV, D, device, cu_seqlens=None, c
     HV-head space (shape [B, T, HV, BT]).  Both FLA (k replicated to HV) and cuLA
     (k compact in HQK) receive the same Akk.
     """
-    q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs_gva(
-        B, T, HQK, HV, D, device, cu_seqlens=cu_seqlens, chunk_size=chunk_size
+    q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(
+        B, T, HQK, D, device, cu_seqlens=cu_seqlens, chunk_size=chunk_size, num_v_heads=HV
     )
 
     # Use cuLA GVA intra to produce Akk in HV space.
