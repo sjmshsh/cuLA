@@ -15,12 +15,11 @@
 """
 bench_recompute_wu.py — Benchmark: cuLA vs FLA Triton for recompute_w_u
 
-Supports both standard (HV=H) and GVA (HV > H) modes via --hv / --heads flags.
-In GVA mode the FLA reference replicates q/k to HV heads; cuLA operates natively
-with compact q/k in HQK space.
+Supports both standard (HV=H) and GVA (HV > H) modes.
+In GVA mode both FLA (v0.5.0+) and cuLA accept compact q/k in HQK space natively.
 
 Usage:
-  python bench_recompute_wu.py [--hv HV] [--disable_recompute]
+  python bench_recompute_wu.py [--heads H] [--hv HV] [--disable_recompute]
 """
 
 import argparse
@@ -88,16 +87,13 @@ def prepare_recompute_wu_inputs(B, T, device, cu_seqlens=None, chunk_size=BT):
 
 
 def run_fla_recompute_wu(k, v, beta, Akk, q, gk, cu_seqlens, chunk_indices, disable_recompute):
-    """FLA recompute_w_u reference (handles both MHA and GVA via q/k replication)."""
-    group_size = HV // H
-    k_ref = k.repeat_interleave(group_size, dim=2).contiguous() if group_size > 1 else k
-    q_ref = q.repeat_interleave(group_size, dim=2).contiguous() if group_size > 1 else q
+    """FLA recompute_w_u reference (handles both MHA and GVA natively as of v0.5.0)."""
     return fla_recompute_w_u_fwd(
-        k=k_ref,
+        k=k,
         v=v,
         beta=beta,
         A=Akk,
-        q=q_ref if disable_recompute else None,
+        q=q if disable_recompute else None,
         gk=gk,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
@@ -293,16 +289,28 @@ if __name__ == "__main__":
         help="Disable recompute in both FLA and cuLA (pre-compute QG)",
     )
     parser.add_argument(
+        "--heads",
+        type=int,
+        default=None,
+        help=f"Override number of Q/K heads (H). Default: {H}.",
+    )
+    parser.add_argument(
         "--hv",
         type=int,
         default=None,
-        help=f"Override number of V heads (HV). Default: H ({H}, no GVA). Set HV > H to run in GVA mode.",
+        help=f"Override number of V heads (HV). Default: H (no GVA). Set HV > H to enable GVA mode.",
     )
     args = parser.parse_args()
 
     if args.disable_recompute:
         DISABLE_RECOMPUTE = True
         print("[Disable recompute] pre-compute QG in forward")
+
+    if args.heads is not None:
+        if args.heads <= 0:
+            raise ValueError(f"--heads must be a positive integer, got {args.heads}")
+        H = args.heads
+        HV = H  # reset HV to new H before --hv override
 
     if args.hv is not None:
         if args.hv < H or args.hv % H != 0:

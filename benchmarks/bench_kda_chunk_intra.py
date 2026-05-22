@@ -15,12 +15,11 @@
 """
 bench_kda_chunk_intra.py — Benchmark: cuLA vs FLA Triton for chunk_kda_fwd_intra
 
-Supports both standard (HV=H) and GVA (HV > H) modes via --hv / --heads flags.
-In GVA mode the FLA reference replicates q/k to HV heads; cuLA operates natively
-with compact q/k in HQK space.
+Supports both standard (HV=H) and GVA (HV > H) modes.
+In GVA mode both FLA (v0.5.0+) and cuLA accept compact q/k in HQK space natively.
 
 Usage:
-  python bench_kda_chunk_intra.py [--hv HV] [--disable_recompute]
+  python bench_kda_chunk_intra.py [--heads H] [--hv HV] [--disable_recompute]
 """
 
 import argparse
@@ -95,31 +94,23 @@ def benchmark_chunk_intra_uniform():
         q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(
             B, T, HQK, D, device, cu_seqlens=cu_seqlens, num_v_heads=HV
         )
-        # FLA reference: replicate q/k to HV heads when in GVA mode
-        q_ref = q.repeat_interleave(group_size, dim=2).contiguous() if gva_mode else q
-        k_ref = k.repeat_interleave(group_size, dim=2).contiguous() if gva_mode else k
 
-        common_fla = dict(
-            q=q_ref, k=k_ref, v=v, gk=g, beta=beta, scale=scale,
-            cu_seqlens=cu_seqlens, chunk_size=chunk_size, chunk_indices=chunk_indices,
-            safe_gate=True, disable_recompute=DISABLE_RECOMPUTE,
-        )
-        common_cula = dict(
+        common = dict(
             q=q, k=k, v=v, gk=g, beta=beta, scale=scale,
             cu_seqlens=cu_seqlens, chunk_size=chunk_size, chunk_indices=chunk_indices,
             safe_gate=True, disable_recompute=DISABLE_RECOMPUTE,
         )
 
         # Accuracy: run once and compare
-        out_fla = fla_chunk_kda_fwd_intra(**common_fla)
-        out_cula = cula_chunk_kda_fwd_intra(**common_cula)
+        out_fla = fla_chunk_kda_fwd_intra(**common)
+        out_cula = cula_chunk_kda_fwd_intra(**common)
         o_fla = out_fla[0] if isinstance(out_fla, (tuple, list)) else out_fla
         o_cula = out_cula[0] if isinstance(out_cula, (tuple, list)) else out_cula
         rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
 
         # Performance
-        ms_fla = triton.testing.do_bench(lambda: fla_chunk_kda_fwd_intra(**common_fla))
-        ms_cula = triton.testing.do_bench(lambda: cula_chunk_kda_fwd_intra(**common_cula))
+        ms_fla = triton.testing.do_bench(lambda: fla_chunk_kda_fwd_intra(**common))
+        ms_cula = triton.testing.do_bench(lambda: cula_chunk_kda_fwd_intra(**common))
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         print(
@@ -161,31 +152,23 @@ def benchmark_chunk_intra_varlen():
         q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(
             1, T, HQK, D, device, cu_seqlens=cu_seqlens, num_v_heads=HV
         )
-        # FLA reference: replicate q/k to HV heads when in GVA mode
-        q_ref = q.repeat_interleave(group_size, dim=2).contiguous() if gva_mode else q
-        k_ref = k.repeat_interleave(group_size, dim=2).contiguous() if gva_mode else k
 
-        common_fla = dict(
-            q=q_ref, k=k_ref, v=v, gk=g, beta=beta, scale=scale,
-            cu_seqlens=cu_seqlens, chunk_size=chunk_size, chunk_indices=chunk_indices,
-            safe_gate=True, disable_recompute=DISABLE_RECOMPUTE,
-        )
-        common_cula = dict(
+        common = dict(
             q=q, k=k, v=v, gk=g, beta=beta, scale=scale,
             cu_seqlens=cu_seqlens, chunk_size=chunk_size, chunk_indices=chunk_indices,
             safe_gate=True, disable_recompute=DISABLE_RECOMPUTE,
         )
 
         # Accuracy
-        out_fla = fla_chunk_kda_fwd_intra(**common_fla)
-        out_cula = cula_chunk_kda_fwd_intra(**common_cula)
+        out_fla = fla_chunk_kda_fwd_intra(**common)
+        out_cula = cula_chunk_kda_fwd_intra(**common)
         o_fla = out_fla[0] if isinstance(out_fla, (tuple, list)) else out_fla
         o_cula = out_cula[0] if isinstance(out_cula, (tuple, list)) else out_cula
         rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
 
         # Performance
-        ms_fla = triton.testing.do_bench(lambda: fla_chunk_kda_fwd_intra(**common_fla))
-        ms_cula = triton.testing.do_bench(lambda: cula_chunk_kda_fwd_intra(**common_cula))
+        ms_fla = triton.testing.do_bench(lambda: fla_chunk_kda_fwd_intra(**common))
+        ms_cula = triton.testing.do_bench(lambda: cula_chunk_kda_fwd_intra(**common))
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         print(
@@ -203,16 +186,28 @@ if __name__ == "__main__":
         help="Disable recompute in both FLA and cuLA (pre-compute QG)",
     )
     parser.add_argument(
+        "--heads",
+        type=int,
+        default=None,
+        help=f"Override number of Q/K heads (H). Default: {H}.",
+    )
+    parser.add_argument(
         "--hv",
         type=int,
         default=None,
-        help=f"Override number of V heads (HV). Default: H ({H}, no GVA). Set HV > H to run in GVA mode.",
+        help=f"Override number of V heads (HV). Default: H (no GVA). Set HV > H to enable GVA mode.",
     )
     args = parser.parse_args()
 
     if args.disable_recompute:
         DISABLE_RECOMPUTE = True
         print("[Disable recompute] pre-compute QG in forward")
+
+    if args.heads is not None:
+        if args.heads <= 0:
+            raise ValueError(f"--heads must be a positive integer, got {args.heads}")
+        H = args.heads
+        HV = H  # reset HV to new H before --hv override
 
     if args.hv is not None:
         if args.hv < H or args.hv % H != 0:
